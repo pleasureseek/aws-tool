@@ -29,7 +29,7 @@ import (
   1) EC2：建实例（可选全开端口 + 可选 user-data）
   2) EC2：控制实例（扫描所有 region）
   3) Lightsail：建光帆（可选全开端口 + 可选 user-data + 可选绑定静态IP）
-  4) Lightsail：控制光帆（扫描所有 region；支持：start/stop/reboot；静态IP增删绑解）
+  4) Lightsail：控制光帆（扫描所有 region；start/stop/reboot；静态IP增删绑解）
 */
 
 const bootstrapRegion = "us-east-1"
@@ -64,6 +64,45 @@ type EC2InstanceRow struct {
 	PrivIP string
 }
 
+// -------------------- UI/Helper --------------------
+
+func regionCN(region string) string {
+	m := map[string]string{
+		"af-south-1":     "南非·开普敦",
+		"ap-east-1":      "中国·香港",
+		"ap-northeast-1": "日本·东京",
+		"ap-northeast-2": "韩国·首尔",
+		"ap-northeast-3": "日本·大阪",
+		"ap-south-1":     "印度·孟买",
+		"ap-south-2":     "印度·海得拉巴",
+		"ap-southeast-1": "新加坡",
+		"ap-southeast-2": "澳大利亚·悉尼",
+		"ap-southeast-3": "印度尼西亚·雅加达",
+		"ap-southeast-4": "澳大利亚·墨尔本",
+		"ca-central-1":   "加拿大·中部",
+		"eu-central-1":   "德国·法兰克福",
+		"eu-central-2":   "瑞士·苏黎世",
+		"eu-north-1":     "瑞典·斯德哥尔摩",
+		"eu-south-1":     "意大利·米兰",
+		"eu-south-2":     "西班牙·马德里",
+		"eu-west-1":      "爱尔兰·都柏林",
+		"eu-west-2":      "英国·伦敦",
+		"eu-west-3":      "法国·巴黎",
+		"il-central-1":   "以色列·特拉维夫",
+		"me-central-1":   "阿联酋·阿布扎比",
+		"me-south-1":     "巴林",
+		"sa-east-1":      "巴西·圣保罗",
+		"us-east-1":      "美国东部·弗吉尼亚",
+		"us-east-2":      "美国东部·俄亥俄",
+		"us-west-1":      "美国西部·加州(北)",
+		"us-west-2":      "美国西部·俄勒冈",
+	}
+	if v, ok := m[region]; ok {
+		return v
+	}
+	return "未知区域"
+}
+
 func input(prompt, def string) string {
 	fmt.Print(prompt)
 	r := bufio.NewReader(os.Stdin)
@@ -76,7 +115,7 @@ func input(prompt, def string) string {
 }
 
 func inputSecret(prompt string) string {
-	// 简化：Windows 控制台不一定能隐藏输入（如需隐藏输入可换 x/term）
+	// 简化：如需隐藏输入可换 x/term
 	fmt.Print(prompt)
 	r := bufio.NewReader(os.Stdin)
 	s, _ := r.ReadString('\n')
@@ -154,7 +193,7 @@ func pickFromList(title string, items []string, def string) (string, error) {
 		}
 	}
 	for i, it := range items {
-		fmt.Printf("  %2d) %s\n", i+1, it)
+		fmt.Printf("  %2d) %-14s ------- %s\n", i+1, it, regionCN(it))
 	}
 	s := input(fmt.Sprintf("请输入编号 [%d]: ", defIdx), fmt.Sprintf("%d", defIdx))
 	idx := mustInt(s)
@@ -163,6 +202,8 @@ func pickFromList(title string, items []string, def string) (string, error) {
 	}
 	return items[idx-1], nil
 }
+
+// -------------------- Regions --------------------
 
 func getEC2Regions(ctx context.Context, creds aws.CredentialsProvider) ([]string, error) {
 	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
@@ -207,9 +248,7 @@ func getLightsailRegions(ctx context.Context, creds aws.CredentialsProvider) ([]
 	return rs, nil
 }
 
-//
 // -------------------- Lightsail --------------------
-//
 
 func lsListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]LSInstanceRow, error) {
 	rows := make([]LSInstanceRow, 0, 8)
@@ -544,10 +583,10 @@ RESELECT:
 		return
 	}
 
-	fmt.Println("\nIDX  REGION        NAME                    STATE      PUBLIC_IP         AZ")
+	fmt.Println("\nIDX  REGION        区域中文           NAME                    STATE      PUBLIC_IP         AZ")
 	for _, r := range rows {
-		fmt.Printf("%-4d %-12s %-22s %-10s %-16s %s\n",
-			r.Idx, r.Region, r.Name, r.State, r.IP, r.AZ)
+		fmt.Printf("%-4d %-12s %-16s %-22s %-10s %-16s %s\n",
+			r.Idx, r.Region, regionCN(r.Region), r.Name, r.State, r.IP, r.AZ)
 	}
 
 	pick := mustInt(input("\n输入要操作的实例编号 IDX（0 返回主菜单）: ", "0"))
@@ -578,7 +617,7 @@ RESELECT:
 			if o.Instance.State != nil {
 				state = aws.ToString(o.Instance.State.Name)
 			}
-			fmt.Printf("\n已选择：%s (%s) state=%s ip=%s\n", sel.Name, sel.Region, state, ip)
+			fmt.Printf("\n已选择：%s (%s / %s) state=%s ip=%s\n", sel.Name, sel.Region, regionCN(sel.Region), state, ip)
 
 			attached, _ := lsFindStaticIPsAttachedTo(ctx, sel.Region, sel.Name, creds)
 			if len(attached) > 0 {
@@ -784,7 +823,7 @@ RESELECT:
 
 		if opErr != nil {
 			fmt.Println("❌ 操作失败：", opErr)
-			fmt.Println("提示：AccessDenied 说明缺对应 lightsail 权限（Allocate/Attach/Detach/Release）")
+			fmt.Println("提示：AccessDenied 说明缺对应 lightsail 权限（Allocate/Attach/Detach/Release/Start/Stop/Reboot）")
 		} else {
 			if act == "1" || act == "2" || act == "3" {
 				fmt.Println("✅ 操作已提交（状态可能需要几十秒变化，可用“刷新状态”查看）")
@@ -793,9 +832,7 @@ RESELECT:
 	}
 }
 
-//
 // -------------------- EC2 --------------------
-//
 
 func ec2ListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]EC2InstanceRow, error) {
 	rows := make([]EC2InstanceRow, 0, 16)
@@ -871,10 +908,10 @@ RESELECT:
 		return
 	}
 
-	fmt.Println("\nIDX  REGION        AZ            INSTANCE_ID           STATE     NAME        TYPE      PUBLIC_IP         PRIVATE_IP")
+	fmt.Println("\nIDX  REGION        区域中文           AZ            INSTANCE_ID           STATE     NAME        TYPE      PUBLIC_IP         PRIVATE_IP")
 	for _, r := range rows {
-		fmt.Printf("%-4d %-12s %-12s %-20s %-9s %-10s %-9s %-16s %s\n",
-			r.Idx, r.Region, r.AZ, r.ID, r.State, cut(r.Name, 10), r.Type, r.PubIP, r.PrivIP)
+		fmt.Printf("%-4d %-12s %-16s %-12s %-20s %-9s %-10s %-9s %-16s %s\n",
+			r.Idx, r.Region, regionCN(r.Region), r.AZ, r.ID, r.State, cut(r.Name, 10), r.Type, r.PubIP, r.PrivIP)
 	}
 
 	pick := mustInt(input("\n输入要操作的实例编号 IDX（0 返回主菜单）: ", "0"))
@@ -913,7 +950,7 @@ RESELECT:
 			}
 		}
 
-		fmt.Printf("\n已选择：%s (%s) state=%s az=%s public_ip=%s\n", sel.ID, sel.Region, stateNow, azNow, pubNow)
+		fmt.Printf("\n已选择：%s (%s / %s) state=%s az=%s public_ip=%s\n", sel.ID, sel.Region, regionCN(sel.Region), stateNow, azNow, pubNow)
 
 		fmt.Println("1) 启动 start")
 		fmt.Println("2) 停止 stop")
@@ -1127,9 +1164,7 @@ func ec2Create(ctx context.Context, regions []string, creds aws.CredentialsProvi
 	}
 }
 
-//
-// -------------------- Main Menu --------------------
-//
+// -------------------- Main --------------------
 
 func main() {
 	ctx := context.Background()
