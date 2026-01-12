@@ -30,6 +30,10 @@ import (
   2) EC2：控制实例（扫描所有 region）
   3) Lightsail：建光帆（可选全开端口 + 可选 user-data）
   4) Lightsail：控制光帆（扫描所有 region）
+
+修复：
+- EC2 控制、Lightsail 控制：执行 start/stop/reboot 后不再返回主菜单
+- 提供：刷新状态、重新选择实例、返回主菜单
 */
 
 type LSInstanceRow struct {
@@ -65,7 +69,7 @@ func input(prompt, def string) string {
 }
 
 func inputSecret(prompt string) string {
-	// 简化：Windows 控制台不一定能隐藏输入（需要真正隐藏我再给 x/term 版本）
+	// 简化：Windows 控制台不一定能隐藏输入（如需隐藏输入可换 x/term）
 	fmt.Print(prompt)
 	r := bufio.NewReader(os.Stdin)
 	s, _ := r.ReadString('\n')
@@ -187,7 +191,7 @@ func getLightsailRegions(ctx context.Context, bootstrap string, creds aws.Creden
 	}
 	var rs []string
 	for _, r := range out.Regions {
-		name := string(r.Name) // string alias
+		name := string(r.Name)
 		if name != "" {
 			rs = append(rs, name)
 		}
@@ -240,7 +244,9 @@ func lsListAll(ctx context.Context, regions []string, creds aws.CredentialsProvi
 	return rows, nil
 }
 
+// ✅ 修复版：Lightsail 控制（循环，执行操作后不回主菜单）
 func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
+RESELECT:
 	rows, _ := lsListAll(ctx, regions, creds)
 	if len(rows) == 0 {
 		fmt.Println("❌ 没找到任何 Lightsail 实例（或权限不足：lightsail:GetInstances）")
@@ -253,13 +259,15 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 			r.Idx, r.Region, r.Name, r.State, r.IP, r.AZ)
 	}
 
-	pick := mustInt(input("\n输入要操作的实例编号 IDX: ", ""))
-	if pick < 1 || pick > len(rows) {
-		fmt.Println("❌ 编号无效")
+	pick := mustInt(input("\n输入要操作的实例编号 IDX（0 返回主菜单）: ", "0"))
+	if pick == 0 {
 		return
 	}
+	if pick < 1 || pick > len(rows) {
+		fmt.Println("❌ 编号无效")
+		goto RESELECT
+	}
 	sel := rows[pick-1]
-	fmt.Printf("\n已选择：%s (%s) state=%s\n\n", sel.Name, sel.Region, sel.State)
 
 	cfg, err := mkCfg(ctx, sel.Region, creds)
 	if err != nil {
@@ -268,50 +276,59 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 	}
 	cli := lightsail.NewFromConfig(cfg)
 
-	fmt.Println("1) 启动 start")
-	fmt.Println("2) 停止 stop")
-	fmt.Println("3) 重启 reboot")
-	fmt.Println("4) 刷新状态")
-	fmt.Println("0) 返回")
-	act := input("请选择 [0]: ", "0")
-
-	switch act {
-	case "1":
-		fmt.Println("🚀 启动中...")
-		_, err = cli.StartInstance(ctx, &lightsail.StartInstanceInput{InstanceName: &sel.Name})
-	case "2":
-		fmt.Println("🛑 停止中...")
-		_, err = cli.StopInstance(ctx, &lightsail.StopInstanceInput{InstanceName: &sel.Name})
-	case "3":
-		fmt.Println("🔁 重启中...")
-		_, err = cli.RebootInstance(ctx, &lightsail.RebootInstanceInput{InstanceName: &sel.Name})
-	case "4":
+	for {
+		// 刷新显示
 		o, e := cli.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: &sel.Name})
-		if e != nil {
-			err = e
-		} else {
+		if e == nil && o.Instance != nil {
 			ip := ""
-			if o.Instance != nil && o.Instance.PublicIpAddress != nil && *o.Instance.PublicIpAddress != "None" {
+			if o.Instance.PublicIpAddress != nil && *o.Instance.PublicIpAddress != "None" {
 				ip = *o.Instance.PublicIpAddress
 			}
 			state := ""
-			if o.Instance != nil && o.Instance.State != nil {
+			if o.Instance.State != nil {
 				state = aws.ToString(o.Instance.State.Name)
 			}
-			fmt.Printf("Name=%s  State=%s  IP=%s  Region=%s\n", sel.Name, state, ip, sel.Region)
+			fmt.Printf("\n已选择：%s (%s) state=%s ip=%s\n", sel.Name, sel.Region, state, ip)
+		} else {
+			fmt.Printf("\n已选择：%s (%s)\n", sel.Name, sel.Region)
 		}
-	case "0":
-		return
-	default:
-		fmt.Println("无效选项")
-		return
-	}
 
-	if err != nil {
-		fmt.Println("❌ 操作失败：", err)
-		fmt.Println("提示：AccessDenied 说明缺 lightsail:Start/Stop/Reboot 权限")
-	} else {
-		fmt.Println("✅ 操作已提交")
+		fmt.Println("1) 启动 start")
+		fmt.Println("2) 停止 stop")
+		fmt.Println("3) 重启 reboot")
+		fmt.Println("4) 刷新状态")
+		fmt.Println("9) 重新选择实例")
+		fmt.Println("0) 返回主菜单")
+		act := input("请选择 [4]: ", "4")
+
+		var opErr error
+		switch act {
+		case "1":
+			fmt.Println("🚀 启动中...")
+			_, opErr = cli.StartInstance(ctx, &lightsail.StartInstanceInput{InstanceName: &sel.Name})
+		case "2":
+			fmt.Println("🛑 停止中...")
+			_, opErr = cli.StopInstance(ctx, &lightsail.StopInstanceInput{InstanceName: &sel.Name})
+		case "3":
+			fmt.Println("🔁 重启中...")
+			_, opErr = cli.RebootInstance(ctx, &lightsail.RebootInstanceInput{InstanceName: &sel.Name})
+		case "4":
+			continue
+		case "9":
+			goto RESELECT
+		case "0":
+			return
+		default:
+			fmt.Println("无效选项")
+			continue
+		}
+
+		if opErr != nil {
+			fmt.Println("❌ 操作失败：", opErr)
+			fmt.Println("提示：AccessDenied 说明缺 lightsail:Start/Stop/Reboot 权限")
+		} else {
+			fmt.Println("✅ 操作已提交（状态可能需要几十秒变化，可用“刷新状态”查看）")
+		}
 	}
 }
 
@@ -328,7 +345,6 @@ func lsWaitRunning(ctx context.Context, cli *lightsail.Client, name string, maxW
 }
 
 func lsOpenAllPortsWithRetry(ctx context.Context, cli *lightsail.Client, name string) error {
-	// 常见错误：instance in transition（pending），所以重试
 	for i := 1; i <= 20; i++ {
 		_, err := cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
 			InstanceName: aws.String(name),
@@ -340,7 +356,6 @@ func lsOpenAllPortsWithRetry(ctx context.Context, cli *lightsail.Client, name st
 		if err == nil {
 			return nil
 		}
-		// 等待后重试
 		time.Sleep(6 * time.Second)
 		if i == 20 {
 			return err
@@ -367,7 +382,6 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	nameDef := "LS-" + region + "-1"
 	name := input(fmt.Sprintf("实例名称 [%s]: ", nameDef), nameDef)
 
-	// 端口是否全开（可选）
 	openAll := yes(input("是否创建后全开端口（TCP/UDP 0-65535 对公网）？[y/N]: ", "n"))
 
 	fmt.Println("\n获取 bundle（套餐）...")
@@ -431,7 +445,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		fmt.Printf("  %2d) %-28s  %-10s  %s %s\n",
 			i+1,
 			aws.ToString(p.BlueprintId),
-			string(p.Platform), // enum -> string
+			string(p.Platform),
 			aws.ToString(p.Name),
 			aws.ToString(p.Version),
 		)
@@ -445,7 +459,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	rawUD, empty := collectUserData("\n可选：Lightsail UserData 初始脚本")
 	userData := ""
 	if !empty {
-		userData = rawUD // Lightsail 明文即可
+		userData = rawUD
 	}
 
 	fmt.Println("\n🚀 创建 Lightsail 实例...")
@@ -566,7 +580,9 @@ func ec2ListAll(ctx context.Context, regions []string, creds aws.CredentialsProv
 	return rows, nil
 }
 
+// ✅ 修复版：EC2 控制（循环，执行操作后不回主菜单）
 func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
+RESELECT:
 	rows, _ := ec2ListAll(ctx, regions, creds)
 	if len(rows) == 0 {
 		fmt.Println("❌ 没找到任何 EC2 实例（或权限不足：ec2:DescribeInstances）")
@@ -579,10 +595,13 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 			r.Idx, r.Region, r.AZ, r.ID, r.State, cut(r.Name, 10), r.Type, r.PubIP, r.PrivIP)
 	}
 
-	pick := mustInt(input("\n输入要操作的实例编号 IDX: ", ""))
+	pick := mustInt(input("\n输入要操作的实例编号 IDX（0 返回主菜单）: ", "0"))
+	if pick == 0 {
+		return
+	}
 	if pick < 1 || pick > len(rows) {
 		fmt.Println("❌ 编号无效")
-		return
+		goto RESELECT
 	}
 	sel := rows[pick-1]
 
@@ -593,67 +612,78 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 	}
 	cli := ec2.NewFromConfig(cfg)
 
-	fmt.Printf("\n已选择：%s (%s) state=%s\n\n", sel.ID, sel.Region, sel.State)
-	fmt.Println("1) 启动 start")
-	fmt.Println("2) 停止 stop")
-	fmt.Println("3) 重启 reboot")
-	fmt.Println("4) 终止 terminate（不可逆）")
-	fmt.Println("5) 刷新状态")
-	fmt.Println("0) 返回")
-	act := input("请选择 [0]: ", "0")
+	for {
+		// 刷新显示
+		stateNow := sel.State
+		pubNow := sel.PubIP
+		azNow := sel.AZ
 
-	switch act {
-	case "1":
-		fmt.Println("🚀 启动中...")
-		_, err = cli.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{sel.ID}})
-	case "2":
-		fmt.Println("🛑 停止中...")
-		_, err = cli.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: []string{sel.ID}})
-	case "3":
-		fmt.Println("🔁 重启中...")
-		_, err = cli.RebootInstances(ctx, &ec2.RebootInstancesInput{InstanceIds: []string{sel.ID}})
-	case "4":
-		fmt.Println("⚠️ 终止不可逆：running/stopped -> shutting-down -> terminated")
-		confirm := input("确认请输入 DELETE: ", "")
-		if confirm != "DELETE" {
-			fmt.Println("已取消")
-			return
-		}
-		fmt.Println("🗑️ 终止中...")
-		_, err = cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
-	case "5":
 		o, e := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{sel.ID}})
-		if e != nil {
-			err = e
-		} else {
-			state := ""
-			pub := ""
-			if len(o.Reservations) > 0 && len(o.Reservations[0].Instances) > 0 {
-				ins := o.Reservations[0].Instances[0]
-				state = string(ins.State.Name)
-				if ins.PublicIpAddress != nil {
-					pub = *ins.PublicIpAddress
-				}
+		if e == nil && len(o.Reservations) > 0 && len(o.Reservations[0].Instances) > 0 {
+			ins := o.Reservations[0].Instances[0]
+			stateNow = string(ins.State.Name)
+			if ins.PublicIpAddress != nil {
+				pubNow = *ins.PublicIpAddress
+			} else {
+				pubNow = ""
 			}
-			fmt.Printf("Instance=%s  state=%s  public_ip=%s  region=%s\n", sel.ID, state, pub, sel.Region)
+			if ins.Placement.AvailabilityZone != nil {
+				azNow = *ins.Placement.AvailabilityZone
+			}
 		}
-	case "0":
-		return
-	default:
-		fmt.Println("无效选项")
-		return
-	}
 
-	if err != nil {
-		fmt.Println("❌ 操作失败：", err)
-		fmt.Println("提示：AccessDenied 说明缺 ec2:Start/Stop/Reboot/Terminate 权限")
-	} else {
-		fmt.Println("✅ 操作已提交")
+		fmt.Printf("\n已选择：%s (%s) state=%s az=%s public_ip=%s\n", sel.ID, sel.Region, stateNow, azNow, pubNow)
+
+		fmt.Println("1) 启动 start")
+		fmt.Println("2) 停止 stop")
+		fmt.Println("3) 重启 reboot")
+		fmt.Println("4) 终止 terminate（不可逆）")
+		fmt.Println("5) 刷新状态")
+		fmt.Println("9) 重新选择实例")
+		fmt.Println("0) 返回主菜单")
+		act := input("请选择 [5]: ", "5")
+
+		var opErr error
+		switch act {
+		case "1":
+			fmt.Println("🚀 启动中...")
+			_, opErr = cli.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{sel.ID}})
+		case "2":
+			fmt.Println("🛑 停止中...")
+			_, opErr = cli.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: []string{sel.ID}})
+		case "3":
+			fmt.Println("🔁 重启中...")
+			_, opErr = cli.RebootInstances(ctx, &ec2.RebootInstancesInput{InstanceIds: []string{sel.ID}})
+		case "4":
+			fmt.Println("⚠️ 终止不可逆：running/stopped -> shutting-down -> terminated")
+			confirm := input("确认请输入 DELETE: ", "")
+			if confirm != "DELETE" {
+				fmt.Println("已取消")
+				continue
+			}
+			fmt.Println("🗑️ 终止中...")
+			_, opErr = cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
+		case "5":
+			continue
+		case "9":
+			goto RESELECT
+		case "0":
+			return
+		default:
+			fmt.Println("无效选项")
+			continue
+		}
+
+		if opErr != nil {
+			fmt.Println("❌ 操作失败：", opErr)
+			fmt.Println("提示：AccessDenied 说明缺 ec2:Start/Stop/Reboot/Terminate 权限")
+		} else {
+			fmt.Println("✅ 操作已提交（状态可能需要几十秒变化，可用“刷新状态”查看）")
+		}
 	}
 }
 
 func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (string, error) {
-	// 找 default VPC
 	vpcs, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{
 		Filters: []ec2t.Filter{{Name: aws.String("isDefault"), Values: []string{"true"}}},
 	})
@@ -667,7 +697,6 @@ func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (strin
 
 	sgName := "open-all-ports"
 
-	// 已存在就复用
 	sgs, _ := cli.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []ec2t.Filter{
 			{Name: aws.String("group-name"), Values: []string{sgName}},
@@ -779,7 +808,7 @@ func ec2Create(ctx context.Context, regions []string, creds aws.CredentialsProvi
 		runIn.SecurityGroupIds = sgIds
 	}
 	if userDataB64 != "" {
-		runIn.UserData = aws.String(userDataB64) // EC2 必须 base64
+		runIn.UserData = aws.String(userDataB64)
 	}
 
 	out, err := cli.RunInstances(ctx, runIn)
