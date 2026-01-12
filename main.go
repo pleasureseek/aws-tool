@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -24,15 +26,17 @@ import (
 
 /*
 功能：
-- 运行 exe 后输入 AK/SK（无 SessionToken / 无引导 Region 输入）
+- 运行 exe 后输入 AK/SK
 - 主菜单：
   1) EC2：建实例（可选全开端口 + 可选 user-data）
-  2) EC2：控制实例（扫描所有 region）
-  3) Lightsail：建光帆（可选全开端口 + 可选 user-data + 可选绑定静态IP）
-  4) Lightsail：控制光帆（扫描所有 region；start/stop/reboot；静态IP增删绑解）
+  2) EC2：控制实例（并发扫描所有 region）
+  3) Lightsail：建光帆（优化版：默认 nano_3_0，数字选择套餐/系统）
+  4) Lightsail：控制光帆（并发扫描所有 region；含静态IP管理）
 */
 
 const bootstrapRegion = "us-east-1"
+
+// --- 数据结构 ---
 
 type LSInstanceRow struct {
 	Idx    int
@@ -64,7 +68,7 @@ type EC2InstanceRow struct {
 	PrivIP string
 }
 
-// -------------------- UI/Helper --------------------
+// -------------------- UI/辅助函数 --------------------
 
 func regionCN(region string) string {
 	m := map[string]string{
@@ -115,7 +119,6 @@ func input(prompt, def string) string {
 }
 
 func inputSecret(prompt string) string {
-	// 简化：如需隐藏输入可换 x/term
 	fmt.Print(prompt)
 	r := bufio.NewReader(os.Stdin)
 	s, _ := r.ReadString('\n')
@@ -147,7 +150,7 @@ func yes(s string) bool {
 
 func collectUserData(promptTitle string) (raw string, isEmpty bool) {
 	fmt.Println(promptTitle)
-	fmt.Println("（直接回车跳过；多行输入用 END 结束）")
+	fmt.Println("（直接回车跳过；如需输入多行，请输入内容后另起一行输入 END 结束）")
 	var lines []string
 	for {
 		l := input("> ", "")
@@ -182,7 +185,7 @@ func stsCheck(ctx context.Context, region string, creds aws.CredentialsProvider)
 
 func pickFromList(title string, items []string, def string) (string, error) {
 	if len(items) == 0 {
-		return "", errors.New("empty list")
+		return "", errors.New("列表为空")
 	}
 	fmt.Println(title)
 	defIdx := 1
@@ -201,6 +204,14 @@ func pickFromList(title string, items []string, def string) (string, error) {
 		return "", fmt.Errorf("编号无效")
 	}
 	return items[idx-1], nil
+}
+
+// 打印对齐表格
+func printTable(header string, rowsFunc func(*tabwriter.Writer)) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, header)
+	rowsFunc(w)
+	w.Flush()
 }
 
 // -------------------- Regions --------------------
@@ -248,45 +259,79 @@ func getLightsailRegions(ctx context.Context, creds aws.CredentialsProvider) ([]
 	return rs, nil
 }
 
-// -------------------- Lightsail --------------------
+// -------------------- Lightsail 逻辑 --------------------
 
+// lsListAll - 并发扫描
 func lsListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]LSInstanceRow, error) {
-	rows := make([]LSInstanceRow, 0, 8)
-	idx := 0
+	var (
+		mu   sync.Mutex
+		rows = make([]LSInstanceRow, 0, 8)
+		wg   sync.WaitGroup
+	)
+
+	fmt.Printf("正在并发扫描 %d 个 Lightsail 区域...\n", len(regions))
+
 	for _, rg := range regions {
-		cfg, err := mkCfg(ctx, rg, creds)
-		if err != nil {
-			continue
-		}
-		cli := lightsail.NewFromConfig(cfg)
-		out, err := cli.GetInstances(ctx, &lightsail.GetInstancesInput{})
-		if err != nil {
-			continue
-		}
-		for _, ins := range out.Instances {
-			idx++
-			ip := ""
-			if ins.PublicIpAddress != nil && *ins.PublicIpAddress != "None" {
-				ip = *ins.PublicIpAddress
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
+
+			cfg, err := mkCfg(ctx, region, creds)
+			if err != nil {
+				return
 			}
-			state := ""
-			if ins.State != nil {
-				state = aws.ToString(ins.State.Name)
+			cli := lightsail.NewFromConfig(cfg)
+			out, err := cli.GetInstances(ctx, &lightsail.GetInstancesInput{})
+			if err != nil {
+				return
 			}
-			az := ""
-			if ins.Location != nil {
-				az = aws.ToString(ins.Location.AvailabilityZone)
+			if len(out.Instances) == 0 {
+				return
 			}
-			rows = append(rows, LSInstanceRow{
-				Idx:    idx,
-				Region: rg,
-				Name:   aws.ToString(ins.Name),
-				State:  state,
-				IP:     ip,
-				AZ:     az,
-			})
-		}
+
+			var localRows []LSInstanceRow
+			for _, ins := range out.Instances {
+				ip := ""
+				if ins.PublicIpAddress != nil && *ins.PublicIpAddress != "None" {
+					ip = *ins.PublicIpAddress
+				}
+				state := ""
+				if ins.State != nil {
+					state = aws.ToString(ins.State.Name)
+				}
+				az := ""
+				if ins.Location != nil {
+					az = aws.ToString(ins.Location.AvailabilityZone)
+				}
+				localRows = append(localRows, LSInstanceRow{
+					Region: region,
+					Name:   aws.ToString(ins.Name),
+					State:  state,
+					IP:     ip,
+					AZ:     az,
+				})
+			}
+
+			mu.Lock()
+			rows = append(rows, localRows...)
+			mu.Unlock()
+
+		}(rg)
 	}
+
+	wg.Wait()
+
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Region == rows[j].Region {
+			return rows[i].Name < rows[j].Name
+		}
+		return rows[i].Region < rows[j].Region
+	})
+
+	for i := range rows {
+		rows[i].Idx = i + 1
+	}
+
 	return rows, nil
 }
 
@@ -299,7 +344,7 @@ func lsWaitRunning(ctx context.Context, cli *lightsail.Client, name string, maxW
 		}
 		time.Sleep(5 * time.Second)
 	}
-	return fmt.Errorf("等待 running 超时")
+	return fmt.Errorf("等待 running 状态超时")
 }
 
 func lsOpenAllPortsWithRetry(ctx context.Context, cli *lightsail.Client, name string) error {
@@ -415,7 +460,9 @@ func lsReleaseStaticIP(ctx context.Context, cli *lightsail.Client, staticIPName 
 	return err
 }
 
+// lsCreate - 优化版：支持数字选择所有套餐和系统
 func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
+	// 1. 选择区域
 	region, err := pickFromList("\n选择 Lightsail Region：", regions, "us-east-1")
 	if err != nil {
 		fmt.Println("❌ 选择失败：", err)
@@ -428,12 +475,13 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	}
 	cli := lightsail.NewFromConfig(cfg)
 
+	// 2. 基础配置
 	azDef := region + "a"
 	az := input(fmt.Sprintf("可用区（如 %sa）[%s]: ", region, azDef), azDef)
 	nameDef := "LS-" + region + "-1"
 	name := input(fmt.Sprintf("实例名称 [%s]: ", nameDef), nameDef)
 
-	openAll := yes(input("是否创建后全开端口（TCP/UDP 0-65535 对公网）？[y/N]: ", "n"))
+	openAll := yes(input("是否创建后全开端口（TCP/UDP 0-65535）？[y/N]: ", "n"))
 	bindStatic := yes(input("是否创建后绑定静态IP（Static IPv4）？[y/N]: ", "n"))
 	staticNameDef := "sip-" + name
 	staticName := staticNameDef
@@ -441,10 +489,11 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		staticName = input(fmt.Sprintf("静态IP名称 [%s]: ", staticNameDef), staticNameDef)
 	}
 
-	fmt.Println("\n获取 bundle（套餐）...")
+	// 3. 选择套餐 (Bundle) - 显示全部
+	fmt.Println("\n正在获取套餐列表...")
 	bOut, err := cli.GetBundles(ctx, &lightsail.GetBundlesInput{})
 	if err != nil {
-		fmt.Println("❌ GetBundles 失败：", err)
+		fmt.Println("❌ 获取套餐失败：", err)
 		return
 	}
 
@@ -453,10 +502,22 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		Price float64
 		Ram   float64
 		Cpu   int32
-		Disk  int32
 	}
-	brs := make([]bRow, 0, len(bOut.Bundles))
+	var brs []bRow
+	
+	// >>>>>> 修改点：默认套餐设置为 nano_3_0 <<<<<<
+	targetBundleDefault := "nano_3_0" 
+	defaultBundleIdx := 1
+
 	for _, b := range bOut.Bundles {
+		// 过滤掉不可用 或 Windows
+		if b.IsActive != nil && !*b.IsActive {
+			continue
+		}
+		if b.SupportedPlatforms != nil && len(b.SupportedPlatforms) > 0 && b.SupportedPlatforms[0] == lst.InstancePlatformWindows {
+			continue
+		}
+
 		price := 0.0
 		if b.Price != nil {
 			price = float64(*b.Price)
@@ -465,113 +526,180 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		if b.RamSizeInGb != nil {
 			ram = float64(*b.RamSizeInGb)
 		}
+
 		brs = append(brs, bRow{
 			ID:    aws.ToString(b.BundleId),
 			Price: price,
 			Ram:   ram,
 			Cpu:   aws.ToInt32(b.CpuCount),
-			Disk:  aws.ToInt32(b.DiskSizeInGb),
 		})
 	}
+	// 按价格排序
 	sort.Slice(brs, func(i, j int) bool { return brs[i].Price < brs[j].Price })
 
-	fmt.Println("（展示前 30 个，按价格从低到高）")
-	for i := 0; i < len(brs) && i < 30; i++ {
-		fmt.Printf("  %2d) %-20s $%-6.2f ram=%.1f cpu=%d disk=%d\n",
-			i+1, brs[i].ID, brs[i].Price, brs[i].Ram, brs[i].Cpu, brs[i].Disk)
-	}
-	bundle := input("输入 bundleId（直接粘贴，例如 nano_3_0）: ", "")
-	if bundle == "" {
-		fmt.Println("❌ bundleId 不能为空")
-		return
+	// 查找默认值索引
+	for i, b := range brs {
+		if b.ID == targetBundleDefault {
+			defaultBundleIdx = i + 1
+			break
+		}
 	}
 
-	fmt.Println("\n获取 blueprint（系统镜像）...")
+	fmt.Println("--- 所有可用 Linux 套餐 (按价格排序) ---")
+	printTable("序号\tID\t价格\t内存\tCPU", func(w *tabwriter.Writer) {
+		for i, b := range brs {
+			marker := ""
+			if i+1 == defaultBundleIdx {
+				marker = " <-- 默认"
+			}
+			fmt.Fprintf(w, "[%d]\t%s\t$%.2f\t%.1f G\t%d vCPU%s\n", i+1, b.ID, b.Price, b.Ram, b.Cpu, marker)
+		}
+	})
+
+	bInput := input(fmt.Sprintf("\n请输入套餐序号 (默认 %d 即 %s): ", defaultBundleIdx, brs[defaultBundleIdx-1].ID), "")
+	finalBundleID := ""
+
+	if bInput == "" {
+		finalBundleID = brs[defaultBundleIdx-1].ID
+	} else if idx, err := strconv.Atoi(bInput); err == nil {
+		if idx >= 1 && idx <= len(brs) {
+			finalBundleID = brs[idx-1].ID
+		} else {
+			fmt.Println("❌ 序号无效，使用默认值。")
+			finalBundleID = brs[defaultBundleIdx-1].ID
+		}
+	} else {
+		finalBundleID = strings.TrimSpace(bInput) // 允许直接粘贴 ID
+	}
+	fmt.Println("👉 已选套餐:", finalBundleID)
+
+	// 4. 选择系统 (Blueprint) - 显示全部
+	fmt.Println("\n正在获取系统镜像 (OS)...")
 	pOut, err := cli.GetBlueprints(ctx, &lightsail.GetBlueprintsInput{})
 	if err != nil {
-		fmt.Println("❌ GetBlueprints 失败：", err)
-		return
-	}
-	max := 40
-	if len(pOut.Blueprints) < max {
-		max = len(pOut.Blueprints)
-	}
-	fmt.Println("（展示前 40 个）")
-	for i := 0; i < max; i++ {
-		p := pOut.Blueprints[i]
-		fmt.Printf("  %2d) %-28s  %-10s  %s %s\n",
-			i+1,
-			aws.ToString(p.BlueprintId),
-			string(p.Platform),
-			aws.ToString(p.Name),
-			aws.ToString(p.Version),
-		)
-	}
-	blue := input("输入 blueprintId（建议 Ubuntu/Debian）: ", "")
-	if blue == "" {
-		fmt.Println("❌ blueprintId 不能为空")
+		fmt.Println("❌ 获取镜像失败：", err)
 		return
 	}
 
-	rawUD, empty := collectUserData("\n可选：Lightsail UserData 初始脚本")
+	type osRow struct {
+		ID      string
+		Name    string
+		Version string
+	}
+	var osList []osRow
+	targetOSDefault := "debian_12" // 默认首选系统
+	defaultOSIdx := 1
+
+	for _, p := range pOut.Blueprints {
+		// 修复常量：仅使用 LinuxUnix
+		if p.Platform != lst.InstancePlatformLinuxUnix {
+			continue
+		}
+		osList = append(osList, osRow{
+			ID:      aws.ToString(p.BlueprintId),
+			Name:    aws.ToString(p.Name),
+			Version: aws.ToString(p.Version),
+		})
+	}
+	
+	// 按名称排序
+	sort.Slice(osList, func(i, j int) bool { return osList[i].ID < osList[j].ID })
+
+	// 查找默认值索引
+	foundDefault := false
+	for i, o := range osList {
+		if o.ID == targetOSDefault {
+			defaultOSIdx = i + 1
+			foundDefault = true
+			break
+		}
+	}
+	// 如果没找到 debian_12，尝试找包含 debian 的
+	if !foundDefault {
+		for i, o := range osList {
+			if strings.Contains(o.ID, "debian") {
+				defaultOSIdx = i + 1
+				break
+			}
+		}
+	}
+
+	fmt.Println("--- 所有可用 Linux 系统镜像 ---")
+	printTable("序号\tID\t名称\t版本", func(w *tabwriter.Writer) {
+		for i, o := range osList {
+			marker := ""
+			if i+1 == defaultOSIdx {
+				marker = " <-- 默认"
+			}
+			fmt.Fprintf(w, "[%d]\t%s\t%s\t%s%s\n", i+1, o.ID, cut(o.Name, 25), cut(o.Version, 15), marker)
+		}
+	})
+
+	osInput := input(fmt.Sprintf("\n请输入系统序号 (默认 %d 即 %s): ", defaultOSIdx, osList[defaultOSIdx-1].ID), "")
+	finalBlueID := ""
+
+	if osInput == "" {
+		finalBlueID = osList[defaultOSIdx-1].ID
+	} else if idx, err := strconv.Atoi(osInput); err == nil {
+		if idx >= 1 && idx <= len(osList) {
+			finalBlueID = osList[idx-1].ID
+		} else {
+			fmt.Println("❌ 序号无效，使用默认值。")
+			finalBlueID = osList[defaultOSIdx-1].ID
+		}
+	} else {
+		finalBlueID = strings.TrimSpace(osInput) // 允许直接粘贴 ID
+	}
+	fmt.Println("👉 已选系统:", finalBlueID)
+
+	// 5. UserData
+	rawUD, empty := collectUserData("\n可选：Lightsail 启动脚本 (UserData)")
 	userData := ""
 	if !empty {
 		userData = rawUD
 	}
 
-	fmt.Println("\n🚀 创建 Lightsail 实例...")
+	// 6. 执行创建
+	fmt.Println("\n🚀 正在提交创建请求...")
 	in := &lightsail.CreateInstancesInput{
 		AvailabilityZone: aws.String(az),
-		BlueprintId:      aws.String(blue),
-		BundleId:         aws.String(bundle),
+		BlueprintId:      aws.String(finalBlueID),
+		BundleId:         aws.String(finalBundleID),
 		InstanceNames:    []string{name},
 	}
 	if userData != "" {
 		in.UserData = aws.String(userData)
 	}
+
 	_, err = cli.CreateInstances(ctx, in)
 	if err != nil {
-		fmt.Println("❌ CreateInstances 失败：", err)
+		fmt.Println("❌ 创建失败:", err)
+		if strings.Contains(err.Error(), "NotFoundException") {
+			fmt.Println("💡 提示: 该套餐 ID 或系统 ID 可能在当前区域不存在，请尝试列表中的其他选项。")
+		}
 		return
 	}
-	fmt.Println("✅ 已提交创建请求：", name)
+	fmt.Println("✅ 实例已创建:", name)
 
-	fmt.Println("⏳ 等待 running...")
+	// 7. 后续操作 (等待、开端口、绑IP)
+	fmt.Println("⏳ 正在等待实例启动 (Running)...")
 	if err := lsWaitRunning(ctx, cli, name, 10*time.Minute); err != nil {
-		fmt.Println("⚠️ 等待 running 超时：", err)
+		fmt.Println("⚠️ 等待超时:", err)
 	}
 
 	if openAll {
-		fmt.Println("🔓 全开端口中（带重试）...")
-		if err := lsOpenAllPortsWithRetry(ctx, cli, name); err != nil {
-			fmt.Println("⚠️ 全开端口失败：", err)
-		} else {
-			fmt.Println("✅ 端口已全开")
-		}
+		fmt.Println("🔓 正在开放所有端口...")
+		lsOpenAllPortsWithRetry(ctx, cli, name)
 	}
 
 	if bindStatic {
-		fmt.Println("🌐 创建/绑定静态IP中...")
-		if err := lsEnsureStaticIP(ctx, cli, staticName); err != nil {
-			fmt.Println("⚠️ AllocateStaticIp 失败：", err)
-		} else if err := lsAttachStaticIP(ctx, cli, staticName, name); err != nil {
-			fmt.Println("⚠️ AttachStaticIp 失败：", err)
+		fmt.Println("🌐 正在绑定静态 IP...")
+		if err := lsEnsureStaticIP(ctx, cli, staticName); err == nil {
+			lsAttachStaticIP(ctx, cli, staticName, name)
+			fmt.Println("✅ 静态 IP 绑定完成:", staticName)
 		} else {
-			fmt.Println("✅ 静态IP已绑定：", staticName)
+			fmt.Println("❌ 静态 IP 操作失败:", err)
 		}
-	}
-
-	o, _ := cli.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: &name})
-	if o != nil && o.Instance != nil {
-		ip := ""
-		if o.Instance.PublicIpAddress != nil {
-			ip = *o.Instance.PublicIpAddress
-		}
-		state := ""
-		if o.Instance.State != nil {
-			state = aws.ToString(o.Instance.State.Name)
-		}
-		fmt.Printf("📡 %s  state=%s  ip=%s  az=%s\n", name, state, ip, az)
 	}
 }
 
@@ -579,29 +707,29 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 RESELECT:
 	rows, _ := lsListAll(ctx, regions, creds)
 	if len(rows) == 0 {
-		fmt.Println("❌ 没找到任何 Lightsail 实例（或权限不足：lightsail:GetInstances）")
+		fmt.Println("❌ 未找到任何 Lightsail 实例。")
 		return
 	}
 
-	fmt.Println("\nIDX  REGION        区域中文           NAME                    STATE      PUBLIC_IP         AZ")
+	fmt.Println("\n序号  区域          区域中文            名称                    状态        公网IP             可用区")
 	for _, r := range rows {
 		fmt.Printf("%-4d %-12s %-16s %-22s %-10s %-16s %s\n",
 			r.Idx, r.Region, regionCN(r.Region), r.Name, r.State, r.IP, r.AZ)
 	}
 
-	pick := mustInt(input("\n输入要操作的实例编号 IDX（0 返回主菜单）: ", "0"))
+	pick := mustInt(input("\n请输入实例序号 IDX (0 返回主菜单): ", "0"))
 	if pick == 0 {
 		return
 	}
 	if pick < 1 || pick > len(rows) {
-		fmt.Println("❌ 编号无效")
+		fmt.Println("❌ 序号无效")
 		goto RESELECT
 	}
 	sel := rows[pick-1]
 
 	cfg, err := mkCfg(ctx, sel.Region, creds)
 	if err != nil {
-		fmt.Println("❌ 初始化失败：", err)
+		fmt.Println("❌ 初始化失败:", err)
 		return
 	}
 	cli := lightsail.NewFromConfig(cfg)
@@ -617,28 +745,24 @@ RESELECT:
 			if o.Instance.State != nil {
 				state = aws.ToString(o.Instance.State.Name)
 			}
-			fmt.Printf("\n已选择：%s (%s / %s) state=%s ip=%s\n", sel.Name, sel.Region, regionCN(sel.Region), state, ip)
+			fmt.Printf("\n当前选择: %s (%s) 状态=%s IP=%s\n", sel.Name, sel.Region, state, ip)
 
 			attached, _ := lsFindStaticIPsAttachedTo(ctx, sel.Region, sel.Name, creds)
 			if len(attached) > 0 {
-				fmt.Println("绑定的静态IP：")
+				fmt.Println("已绑定的静态 IP:")
 				for _, a := range attached {
-					fmt.Printf(" - %s  ip=%s\n", a.Name, a.IP)
+					fmt.Printf(" - %s  IP=%s\n", a.Name, a.IP)
 				}
-			} else {
-				fmt.Println("绑定的静态IP：无")
 			}
-		} else {
-			fmt.Printf("\n已选择：%s (%s)\n", sel.Name, sel.Region)
 		}
 
-		fmt.Println("\n1) 启动 start")
-		fmt.Println("2) 停止 stop")
-		fmt.Println("3) 重启 reboot")
+		fmt.Println("\n1) 启动 (Start)")
+		fmt.Println("2) 停止 (Stop)")
+		fmt.Println("3) 重启 (Reboot)")
 		fmt.Println("4) 刷新状态")
-		fmt.Println("5) 添加/绑定 静态IP（Static IPv4）")
-		fmt.Println("6) 解绑 静态IP（Static IPv4）")
-		fmt.Println("7) 删除(释放) 静态IP（Static IPv4）")
+		fmt.Println("5) 创建并绑定静态 IP")
+		fmt.Println("6) 解绑静态 IP")
+		fmt.Println("7) 删除静态 IP")
 		fmt.Println("9) 重新选择实例")
 		fmt.Println("0) 返回主菜单")
 		act := input("请选择 [4]: ", "4")
@@ -646,255 +770,160 @@ RESELECT:
 		var opErr error
 		switch act {
 		case "1":
-			fmt.Println("🚀 启动中...")
+			fmt.Println("🚀 正在启动...")
 			_, opErr = cli.StartInstance(ctx, &lightsail.StartInstanceInput{InstanceName: &sel.Name})
-
 		case "2":
-			fmt.Println("🛑 停止中...")
+			fmt.Println("🛑 正在停止...")
 			_, opErr = cli.StopInstance(ctx, &lightsail.StopInstanceInput{InstanceName: &sel.Name})
-
 		case "3":
-			fmt.Println("🔁 重启中...")
+			fmt.Println("🔁 正在重启...")
 			_, opErr = cli.RebootInstance(ctx, &lightsail.RebootInstanceInput{InstanceName: &sel.Name})
-
 		case "4":
 			continue
-
-		case "5":
-			fmt.Println("\n静态IP 绑定：")
-			fmt.Println("  1) 创建新静态IP并绑定到该实例")
-			fmt.Println("  2) 绑定现有静态IP到该实例")
-			fmt.Println("  0) 取消")
-			sub := input("请选择 [1]: ", "1")
-
-			switch sub {
-			case "0":
-				continue
-			case "1":
-				def := "sip-" + sel.Name
-				sip := input(fmt.Sprintf("静态IP名称 [%s]: ", def), def)
-				if sip == "" {
-					fmt.Println("❌ 名称不能为空")
-					continue
-				}
-				fmt.Println("🌐 AllocateStaticIp...")
-				if err := lsEnsureStaticIP(ctx, cli, sip); err != nil {
-					fmt.Println("❌ 创建静态IP失败：", err)
-					continue
-				}
-				fmt.Println("🔗 AttachStaticIp...")
+		case "5": // Bind IP
+			def := "sip-" + sel.Name
+			sip := input(fmt.Sprintf("静态 IP 名称 [%s]: ", def), def)
+			if sip != "" {
+				lsEnsureStaticIP(ctx, cli, sip)
 				opErr = lsAttachStaticIP(ctx, cli, sip, sel.Name)
 				if opErr == nil {
-					fmt.Println("✅ 已绑定静态IP：", sip)
+					fmt.Println("✅ 已绑定:", sip)
 				}
-			case "2":
-				all, err := lsListStaticIPsInRegion(ctx, sel.Region, creds)
-				if err != nil {
-					fmt.Println("❌ GetStaticIps 失败：", err)
-					continue
-				}
-				if len(all) == 0 {
-					fmt.Println("❌ 当前 region 没有任何静态IP，请先创建")
-					continue
-				}
-				fmt.Println("\nIDX  NAME                 IP              ATTACHED_TO")
-				for _, r := range all {
-					att := r.AttachedTo
-					if att == "" {
-						att = "-"
-					}
-					fmt.Printf("%-4d %-20s %-15s %s\n", r.Idx, r.Name, r.IP, att)
-				}
-				p := mustInt(input("输入要绑定的静态IP编号 IDX（0 取消）: ", "0"))
-				if p == 0 {
-					continue
-				}
-				if p < 1 || p > len(all) {
-					fmt.Println("❌ 编号无效")
-					continue
-				}
-				sip := all[p-1]
-				if sip.IsAttached && sip.AttachedTo != sel.Name {
-					fmt.Println("❌ 该静态IP已绑定到别的实例：", sip.AttachedTo)
-					continue
-				}
-				fmt.Println("🔗 AttachStaticIp...")
-				opErr = lsAttachStaticIP(ctx, cli, sip.Name, sel.Name)
-				if opErr == nil {
-					fmt.Println("✅ 已绑定静态IP：", sip.Name)
-				}
-			default:
-				fmt.Println("无效选项")
-				continue
 			}
-
-		case "6":
-			attached, err := lsFindStaticIPsAttachedTo(ctx, sel.Region, sel.Name, creds)
-			if err != nil {
-				fmt.Println("❌ 获取静态IP失败：", err)
-				continue
+		case "6": // Detach IP
+			attached, _ := lsFindStaticIPsAttachedTo(ctx, sel.Region, sel.Name, creds)
+			if len(attached) > 0 {
+				fmt.Printf("正在解绑 %s...\n", attached[0].Name)
+				opErr = lsDetachStaticIP(ctx, cli, attached[0].Name)
+			} else {
+				fmt.Println("当前无静态 IP。")
 			}
-			if len(attached) == 0 {
-				fmt.Println("当前实例没有绑定任何静态IP")
-				continue
-			}
-			fmt.Println("\nIDX  NAME                 IP")
-			for _, a := range attached {
-				fmt.Printf("%-4d %-20s %-15s\n", a.Idx, a.Name, a.IP)
-			}
-			p := mustInt(input("输入要解绑的静态IP编号 IDX（0 取消）: ", "0"))
-			if p == 0 {
-				continue
-			}
-			if p < 1 || p > len(attached) {
-				fmt.Println("❌ 编号无效")
-				continue
-			}
-			sip := attached[p-1]
-			fmt.Println("🔓 DetachStaticIp...")
-			opErr = lsDetachStaticIP(ctx, cli, sip.Name)
-			if opErr == nil {
-				fmt.Println("✅ 已解绑：", sip.Name)
-			}
-
-		case "7":
-			all, err := lsListStaticIPsInRegion(ctx, sel.Region, creds)
-			if err != nil {
-				fmt.Println("❌ GetStaticIps 失败：", err)
-				continue
-			}
+		case "7": // Delete IP
+			all, _ := lsListStaticIPsInRegion(ctx, sel.Region, creds)
 			if len(all) == 0 {
-				fmt.Println("当前 region 没有任何静态IP")
+				fmt.Println("该区域无静态 IP。")
 				continue
 			}
-			fmt.Println("\nIDX  NAME                 IP              ATTACHED_TO")
 			for _, r := range all {
 				att := r.AttachedTo
 				if att == "" {
 					att = "-"
 				}
-				fmt.Printf("%-4d %-20s %-15s %s\n", r.Idx, r.Name, r.IP, att)
+				fmt.Printf(" - %s (IP: %s) -> %s\n", r.Name, r.IP, att)
 			}
-			p := mustInt(input("输入要删除(释放)的静态IP编号 IDX（0 取消）: ", "0"))
-			if p == 0 {
-				continue
-			}
-			if p < 1 || p > len(all) {
-				fmt.Println("❌ 编号无效")
-				continue
-			}
-			sip := all[p-1]
-
-			fmt.Println("⚠️ 删除静态IP不可逆：释放后该IP不再属于你")
-			confirm := input("确认请输入 DELETE: ", "")
-			if confirm != "DELETE" {
-				fmt.Println("已取消")
-				continue
-			}
-
-			if sip.IsAttached {
-				fmt.Printf("该静态IP当前绑定到：%s\n", sip.AttachedTo)
-				if !yes(input("是否先解绑再释放？[y/N]: ", "n")) {
-					fmt.Println("已取消")
-					continue
+			sipName := input("请输入要删除的静态 IP 名称: ", "")
+			if sipName != "" {
+				lsDetachStaticIP(ctx, cli, sipName) // 尝试先解绑
+				time.Sleep(1 * time.Second)
+				opErr = lsReleaseStaticIP(ctx, cli, sipName)
+				if opErr == nil {
+					fmt.Println("✅ 已删除:", sipName)
 				}
-				fmt.Println("🔓 DetachStaticIp...")
-				if err := lsDetachStaticIP(ctx, cli, sip.Name); err != nil {
-					fmt.Println("❌ 解绑失败：", err)
-					continue
-				}
-				time.Sleep(2 * time.Second)
 			}
-
-			fmt.Println("🗑️ ReleaseStaticIp...")
-			opErr = lsReleaseStaticIP(ctx, cli, sip.Name)
-			if opErr == nil {
-				fmt.Println("✅ 已释放静态IP：", sip.Name)
-			}
-
 		case "9":
 			goto RESELECT
 		case "0":
 			return
 		default:
-			fmt.Println("无效选项")
 			continue
 		}
 
 		if opErr != nil {
-			fmt.Println("❌ 操作失败：", opErr)
-			fmt.Println("提示：AccessDenied 说明缺对应 lightsail 权限（Allocate/Attach/Detach/Release/Start/Stop/Reboot）")
-		} else {
-			if act == "1" || act == "2" || act == "3" {
-				fmt.Println("✅ 操作已提交（状态可能需要几十秒变化，可用“刷新状态”查看）")
-			}
+			fmt.Println("❌ 错误:", opErr)
 		}
 	}
 }
 
-// -------------------- EC2 --------------------
+// -------------------- EC2 逻辑 --------------------
 
+// ec2ListAll - 并发扫描
 func ec2ListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]EC2InstanceRow, error) {
-	rows := make([]EC2InstanceRow, 0, 16)
-	idx := 0
+	var (
+		mu   sync.Mutex
+		rows = make([]EC2InstanceRow, 0, 16)
+		wg   sync.WaitGroup
+	)
+
+	fmt.Printf("正在并发扫描 %d 个 EC2 区域...\n", len(regions))
 
 	for _, rg := range regions {
-		cfg, err := mkCfg(ctx, rg, creds)
-		if err != nil {
-			continue
-		}
-		cli := ec2.NewFromConfig(cfg)
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
 
-		out, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-			Filters: []ec2t.Filter{
-				{
-					Name:   aws.String("instance-state-name"),
-					Values: []string{"pending", "running", "stopping", "stopped", "shutting-down"},
-				},
-			},
-		})
-		if err != nil {
-			continue
-		}
-
-		for _, res := range out.Reservations {
-			for _, ins := range res.Instances {
-				idx++
-				name := ""
-				for _, t := range ins.Tags {
-					if t.Key != nil && *t.Key == "Name" && t.Value != nil {
-						name = *t.Value
-						break
-					}
-				}
-				az := ""
-				if ins.Placement.AvailabilityZone != nil {
-					az = *ins.Placement.AvailabilityZone
-				}
-				pub := ""
-				if ins.PublicIpAddress != nil {
-					pub = *ins.PublicIpAddress
-				}
-				priv := ""
-				if ins.PrivateIpAddress != nil {
-					priv = *ins.PrivateIpAddress
-				}
-				state := string(ins.State.Name)
-				typ := string(ins.InstanceType)
-
-				rows = append(rows, EC2InstanceRow{
-					Idx:    idx,
-					Region: rg,
-					AZ:     az,
-					ID:     aws.ToString(ins.InstanceId),
-					State:  state,
-					Name:   name,
-					Type:   typ,
-					PubIP:  pub,
-					PrivIP: priv,
-				})
+			cfg, err := mkCfg(ctx, region, creds)
+			if err != nil {
+				return
 			}
+			cli := ec2.NewFromConfig(cfg)
+
+			out, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+				Filters: []ec2t.Filter{
+					{
+						Name:   aws.String("instance-state-name"),
+						Values: []string{"pending", "running", "stopping", "stopped", "shutting-down"},
+					},
+				},
+			})
+			if err != nil {
+				return
+			}
+
+			var localRows []EC2InstanceRow
+			for _, res := range out.Reservations {
+				for _, ins := range res.Instances {
+					name := ""
+					for _, t := range ins.Tags {
+						if t.Key != nil && *t.Key == "Name" && t.Value != nil {
+							name = *t.Value
+							break
+						}
+					}
+					az := ""
+					if ins.Placement.AvailabilityZone != nil {
+						az = *ins.Placement.AvailabilityZone
+					}
+					pub := ""
+					if ins.PublicIpAddress != nil {
+						pub = *ins.PublicIpAddress
+					}
+					priv := ""
+					if ins.PrivateIpAddress != nil {
+						priv = *ins.PrivateIpAddress
+					}
+					state := string(ins.State.Name)
+					typ := string(ins.InstanceType)
+
+					localRows = append(localRows, EC2InstanceRow{
+						Region: region,
+						AZ:     az,
+						ID:     aws.ToString(ins.InstanceId),
+						State:  state,
+						Name:   name,
+						Type:   typ,
+						PubIP:  pub,
+						PrivIP: priv,
+					})
+				}
+			}
+
+			mu.Lock()
+			rows = append(rows, localRows...)
+			mu.Unlock()
+		}(rg)
+	}
+
+	wg.Wait()
+
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Region == rows[j].Region {
+			return rows[i].ID < rows[j].ID
 		}
+		return rows[i].Region < rows[j].Region
+	})
+
+	for i := range rows {
+		rows[i].Idx = i + 1
 	}
 
 	return rows, nil
@@ -904,58 +933,45 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 RESELECT:
 	rows, _ := ec2ListAll(ctx, regions, creds)
 	if len(rows) == 0 {
-		fmt.Println("❌ 没找到任何 EC2 实例（或权限不足：ec2:DescribeInstances）")
+		fmt.Println("❌ 未找到任何 EC2 实例。")
 		return
 	}
 
-	fmt.Println("\nIDX  REGION        区域中文           AZ            INSTANCE_ID           STATE     NAME        TYPE      PUBLIC_IP         PRIVATE_IP")
+	fmt.Println("\n序号  区域          区域中文            AZ           实例ID                 状态        名称        类型       公网IP             内网IP")
 	for _, r := range rows {
 		fmt.Printf("%-4d %-12s %-16s %-12s %-20s %-9s %-10s %-9s %-16s %s\n",
 			r.Idx, r.Region, regionCN(r.Region), r.AZ, r.ID, r.State, cut(r.Name, 10), r.Type, r.PubIP, r.PrivIP)
 	}
 
-	pick := mustInt(input("\n输入要操作的实例编号 IDX（0 返回主菜单）: ", "0"))
+	pick := mustInt(input("\n请输入实例序号 IDX (0 返回主菜单): ", "0"))
 	if pick == 0 {
 		return
 	}
 	if pick < 1 || pick > len(rows) {
-		fmt.Println("❌ 编号无效")
+		fmt.Println("❌ 序号无效")
 		goto RESELECT
 	}
 	sel := rows[pick-1]
 
 	cfg, err := mkCfg(ctx, sel.Region, creds)
 	if err != nil {
-		fmt.Println("❌ 初始化失败：", err)
+		fmt.Println("❌ 初始化失败:", err)
 		return
 	}
 	cli := ec2.NewFromConfig(cfg)
 
 	for {
-		stateNow := sel.State
-		pubNow := sel.PubIP
-		azNow := sel.AZ
-
 		o, e := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{sel.ID}})
-		if e == nil && len(o.Reservations) > 0 && len(o.Reservations[0].Instances) > 0 {
-			ins := o.Reservations[0].Instances[0]
-			stateNow = string(ins.State.Name)
-			if ins.PublicIpAddress != nil {
-				pubNow = *ins.PublicIpAddress
-			} else {
-				pubNow = ""
-			}
-			if ins.Placement.AvailabilityZone != nil {
-				azNow = *ins.Placement.AvailabilityZone
-			}
+		stateNow := sel.State
+		if e == nil && len(o.Reservations) > 0 {
+			stateNow = string(o.Reservations[0].Instances[0].State.Name)
 		}
+		fmt.Printf("\n当前选择: %s (%s) 状态=%s\n", sel.ID, sel.Region, stateNow)
 
-		fmt.Printf("\n已选择：%s (%s / %s) state=%s az=%s public_ip=%s\n", sel.ID, sel.Region, regionCN(sel.Region), stateNow, azNow, pubNow)
-
-		fmt.Println("1) 启动 start")
-		fmt.Println("2) 停止 stop")
-		fmt.Println("3) 重启 reboot")
-		fmt.Println("4) 终止 terminate（不可逆）")
+		fmt.Println("1) 启动 (Start)")
+		fmt.Println("2) 停止 (Stop)")
+		fmt.Println("3) 重启 (Reboot)")
+		fmt.Println("4) 终止 (Terminate)")
 		fmt.Println("5) 刷新状态")
 		fmt.Println("9) 重新选择实例")
 		fmt.Println("0) 返回主菜单")
@@ -964,23 +980,23 @@ RESELECT:
 		var opErr error
 		switch act {
 		case "1":
-			fmt.Println("🚀 启动中...")
+			fmt.Println("🚀 正在启动...")
 			_, opErr = cli.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{sel.ID}})
 		case "2":
-			fmt.Println("🛑 停止中...")
+			fmt.Println("🛑 正在停止...")
 			_, opErr = cli.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: []string{sel.ID}})
 		case "3":
-			fmt.Println("🔁 重启中...")
+			fmt.Println("🔁 正在重启...")
 			_, opErr = cli.RebootInstances(ctx, &ec2.RebootInstancesInput{InstanceIds: []string{sel.ID}})
 		case "4":
-			fmt.Println("⚠️ 终止不可逆：running/stopped -> shutting-down -> terminated")
-			confirm := input("确认请输入 DELETE: ", "")
-			if confirm != "DELETE" {
-				fmt.Println("已取消")
-				continue
+			fmt.Println("⚠️ 警告：终止实例是不可逆的！")
+			confirm := input("请输入 DELETE 以确认删除: ", "")
+			if confirm == "DELETE" {
+				fmt.Println("🗑️ 正在终止...")
+				_, opErr = cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
+			} else {
+				fmt.Println("已取消。")
 			}
-			fmt.Println("🗑️ 终止中...")
-			_, opErr = cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
 		case "5":
 			continue
 		case "9":
@@ -988,15 +1004,11 @@ RESELECT:
 		case "0":
 			return
 		default:
-			fmt.Println("无效选项")
 			continue
 		}
 
 		if opErr != nil {
-			fmt.Println("❌ 操作失败：", opErr)
-			fmt.Println("提示：AccessDenied 说明缺 ec2:Start/Stop/Reboot/Terminate 权限")
-		} else {
-			fmt.Println("✅ 操作已提交（状态可能需要几十秒变化，可用“刷新状态”查看）")
+			fmt.Println("❌ 错误:", opErr)
 		}
 	}
 }
@@ -1009,10 +1021,9 @@ func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (strin
 		return "", err
 	}
 	if len(vpcs.Vpcs) == 0 || vpcs.Vpcs[0].VpcId == nil {
-		return "", fmt.Errorf("未找到 default VPC（region=%s）", region)
+		return "", fmt.Errorf("未在 %s 找到默认 VPC", region)
 	}
 	vpcID := *vpcs.Vpcs[0].VpcId
-
 	sgName := "open-all-ports"
 
 	sgs, _ := cli.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
@@ -1021,28 +1032,22 @@ func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (strin
 			{Name: aws.String("vpc-id"), Values: []string{vpcID}},
 		},
 	})
-	if len(sgs.SecurityGroups) > 0 && sgs.SecurityGroups[0].GroupId != nil {
+	if len(sgs.SecurityGroups) > 0 {
 		sgID := *sgs.SecurityGroups[0].GroupId
-		_ = authorizeOpenAll(ctx, cli, sgID)
+		authorizeOpenAll(ctx, cli, sgID)
 		return sgID, nil
 	}
 
 	created, err := cli.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
 		GroupName:   aws.String(sgName),
-		Description: aws.String("Open all TCP/UDP ports (0-65535) to 0.0.0.0/0"),
+		Description: aws.String("Open all TCP/UDP ports 0-65535"),
 		VpcId:       aws.String(vpcID),
 	})
 	if err != nil {
 		return "", err
 	}
-	if created.GroupId == nil {
-		return "", fmt.Errorf("CreateSecurityGroup 未返回 GroupId")
-	}
 	sgID := *created.GroupId
-
-	if err := authorizeOpenAll(ctx, cli, sgID); err != nil {
-		return "", err
-	}
+	authorizeOpenAll(ctx, cli, sgID)
 	return sgID, nil
 }
 
@@ -1050,24 +1055,10 @@ func authorizeOpenAll(ctx context.Context, cli *ec2.Client, sgID string) error {
 	_, err := cli.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(sgID),
 		IpPermissions: []ec2t.IpPermission{
-			{
-				IpProtocol: aws.String("tcp"),
-				FromPort:   aws.Int32(0),
-				ToPort:     aws.Int32(65535),
-				IpRanges:   []ec2t.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
-			},
-			{
-				IpProtocol: aws.String("udp"),
-				FromPort:   aws.Int32(0),
-				ToPort:     aws.Int32(65535),
-				IpRanges:   []ec2t.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
-			},
+			{IpProtocol: aws.String("-1"), IpRanges: []ec2t.IpRange{{CidrIp: aws.String("0.0.0.0/0")}}},
 		},
 	})
-	if err != nil {
-		if strings.Contains(err.Error(), "InvalidPermission.Duplicate") {
-			return nil
-		}
+	if err != nil && !strings.Contains(err.Error(), "InvalidPermission.Duplicate") {
 		return err
 	}
 	return nil
@@ -1076,27 +1067,26 @@ func authorizeOpenAll(ctx context.Context, cli *ec2.Client, sgID string) error {
 func ec2Create(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
 	region, err := pickFromList("\n选择 EC2 Region：", regions, "us-east-1")
 	if err != nil {
-		fmt.Println("❌ 选择失败：", err)
+		fmt.Println("❌ 错误:", err)
 		return
 	}
 	cfg, err := mkCfg(ctx, region, creds)
 	if err != nil {
-		fmt.Println("❌ 初始化失败：", err)
+		fmt.Println("❌ 错误:", err)
 		return
 	}
 	cli := ec2.NewFromConfig(cfg)
 
-	ami := input("AMI ID（必须，例如 ami-xxxxxxxx）: ", "")
+	ami := input("AMI ID (必须, 如 ami-xxxx): ", "")
 	if ami == "" {
-		fmt.Println("❌ AMI 不能为空")
+		fmt.Println("❌ 必须输入 AMI ID")
 		return
 	}
-	itype := input("Instance Type [t3.micro]: ", "t3.micro")
-	name := input("Name 标签（可空）: ", "")
+	itype := input("实例类型 [t3.micro]: ", "t3.micro")
+	name := input("实例名称 (Name标签): ", "")
+	openAll := yes(input("是否全开端口 (安全组)? [y/N]: ", "n"))
 
-	openAll := yes(input("是否创建/使用安全组并全开端口（TCP/UDP 0-65535 对公网）？[y/N]: ", "n"))
-
-	rawUD, empty := collectUserData("\n可选：EC2 UserData 启动脚本（注意：EC2 会自动 Base64）")
+	rawUD, empty := collectUserData("\n可选：EC2 启动脚本 (UserData)")
 	userDataB64 := ""
 	if !empty {
 		userDataB64 = base64.StdEncoding.EncodeToString([]byte(rawUD))
@@ -1104,18 +1094,17 @@ func ec2Create(ctx context.Context, regions []string, creds aws.CredentialsProvi
 
 	sgIds := []string{}
 	if openAll {
-		sgID, e := ensureOpenAllSG(ctx, cli, region)
-		if e != nil {
-			fmt.Println("❌ 创建/配置安全组失败：", e)
+		sgID, err := ensureOpenAllSG(ctx, cli, region)
+		if err == nil {
+			sgIds = append(sgIds, sgID)
+			fmt.Println("✅ 使用安全组:", sgID)
+		} else {
+			fmt.Println("❌ 安全组错误:", err)
 			return
 		}
-		sgIds = []string{sgID}
-		fmt.Println("✅ 将使用安全组：", sgID)
-	} else {
-		fmt.Println("（未选择全开端口，将使用默认安全组/默认规则）")
 	}
 
-	fmt.Println("\n🚀 RunInstances...")
+	fmt.Println("\n🚀 正在启动实例...")
 	runIn := &ec2.RunInstancesInput{
 		ImageId:      aws.String(ami),
 		InstanceType: ec2t.InstanceType(itype),
@@ -1131,36 +1120,17 @@ func ec2Create(ctx context.Context, regions []string, creds aws.CredentialsProvi
 
 	out, err := cli.RunInstances(ctx, runIn)
 	if err != nil {
-		fmt.Println("❌ RunInstances 失败：", err)
-		fmt.Println("提示：AMI 不在该 region 或缺权限 ec2:RunInstances")
-		return
-	}
-	if len(out.Instances) == 0 || out.Instances[0].InstanceId == nil {
-		fmt.Println("❌ 创建失败：未返回实例 ID")
+		fmt.Println("❌ 启动失败:", err)
 		return
 	}
 	id := *out.Instances[0].InstanceId
-	fmt.Println("✅ 已创建实例：", id)
+	fmt.Println("✅ 启动成功:", id)
 
 	if name != "" {
-		_, _ = cli.CreateTags(ctx, &ec2.CreateTagsInput{
+		cli.CreateTags(ctx, &ec2.CreateTagsInput{
 			Resources: []string{id},
 			Tags:      []ec2t.Tag{{Key: aws.String("Name"), Value: aws.String(name)}},
 		})
-	}
-
-	fmt.Println("⏳ 等待 running（最多 ~10 分钟）...")
-	waiter := ec2.NewInstanceRunningWaiter(cli)
-	_ = waiter.Wait(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}}, 10*time.Minute)
-
-	desc, _ := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
-	if len(desc.Reservations) > 0 && len(desc.Reservations[0].Instances) > 0 {
-		ins := desc.Reservations[0].Instances[0]
-		pub := ""
-		if ins.PublicIpAddress != nil {
-			pub = *ins.PublicIpAddress
-		}
-		fmt.Printf("📡 %s  state=%s  public_ip=%s  region=%s\n", id, string(ins.State.Name), pub, region)
 	}
 }
 
@@ -1169,49 +1139,37 @@ func ec2Create(ctx context.Context, regions []string, creds aws.CredentialsProvi
 func main() {
 	ctx := context.Background()
 
-	fmt.Println("=== AWS 管理工具（Go SDK / 运行后输入AKSK）===")
-	fmt.Println("功能：EC2 建/管 + Lightsail 建/管\n")
+	fmt.Println("=== AWS 管理工具 (Go SDK) ===")
+	fmt.Println("功能：EC2 / Lightsail 创建与管理\n")
 
 	ak := input("AWS Access Key ID: ", "")
 	sk := inputSecret("AWS Secret Access Key: ")
 	if ak == "" || sk == "" {
-		fmt.Println("❌ AK/SK 不能为空")
+		fmt.Println("❌ 必须输入 AK/SK")
 		return
 	}
 
 	creds := credentials.NewStaticCredentialsProvider(ak, sk, "")
 
-	fmt.Printf("\n🔍 校验凭证（bootstrap=%s）...\n", bootstrapRegion)
+	fmt.Printf("\n🔍 正在验证凭证 (bootstrap=%s)...\n", bootstrapRegion)
 	if err := stsCheck(ctx, bootstrapRegion, creds); err != nil {
-		fmt.Println("❌ 凭证校验失败：", err)
+		fmt.Println("❌ 凭证无效:", err)
 		return
 	}
-	fmt.Println("✅ 凭证有效")
+	fmt.Println("✅ 验证成功。")
 
-	fmt.Println("\n🌍 获取 EC2 Regions...")
-	ec2Regions, err := getEC2Regions(ctx, creds)
-	if err != nil {
-		fmt.Println("⚠️ 获取 EC2 Regions 失败：", err)
-		ec2Regions = []string{bootstrapRegion}
-	} else {
-		fmt.Printf("✅ EC2 Regions: %d\n", len(ec2Regions))
-	}
-
-	fmt.Println("\n🌍 获取 Lightsail Regions...")
-	lsRegions, err := getLightsailRegions(ctx, creds)
-	if err != nil {
-		fmt.Println("⚠️ 获取 Lightsail Regions 失败：", err)
-		lsRegions = []string{bootstrapRegion}
-	} else {
-		fmt.Printf("✅ Lightsail Regions: %d\n", len(lsRegions))
-	}
+	fmt.Println("\n🌍 获取区域列表...")
+	ec2Regions, _ := getEC2Regions(ctx, creds)
+	lsRegions, _ := getLightsailRegions(ctx, creds)
+	fmt.Printf("✅ EC2 区域: %d 个\n", len(ec2Regions))
+	fmt.Printf("✅ Lightsail 区域: %d 个\n", len(lsRegions))
 
 	for {
 		fmt.Println("\n================ 主菜单 ================")
-		fmt.Println("1) EC2：建实例（可选全开端口 + 可选 user-data）")
-		fmt.Println("2) EC2：控制实例（扫描所有 region）")
-		fmt.Println("3) Lightsail：建光帆（可选全开端口 + 可选 user-data + 可选绑定静态IP）")
-		fmt.Println("4) Lightsail：控制光帆（扫描所有 region；含静态IP管理）")
+		fmt.Println("1) EC2：创建实例")
+		fmt.Println("2) EC2：控制实例（全球并发扫描）")
+		fmt.Println("3) Lightsail：创建实例")
+		fmt.Println("4) Lightsail：控制实例（全球并发扫描）")
 		fmt.Println("0) 退出")
 		act := input("请选择 [0]: ", "0")
 
