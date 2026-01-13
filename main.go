@@ -27,14 +27,9 @@ import (
 )
 
 /*
-功能：
-- 运行 exe 后输入 AK/SK
-- 主菜单：
-  1) EC2：建实例 (架构选择 + T2/T3/T4g 全系列 + 自动网络)
-  2) EC2：控制实例 (终止时自动释放关联 EIP)
-  3) Lightsail：建光帆
-  4) Lightsail：控制光帆 (详情优化 + 管理功能)
-  5) 查询配额
+AWS Manager (Go) - 中文版 (Win/Linux)
+- 显示优化：全开端口显示为“全部允许”
+- 功能：EC2/光帆管理、自动防火墙、固定IP管理
 */
 
 const bootstrapRegion = "us-east-1"
@@ -489,21 +484,63 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	oIn := input(fmt.Sprintf("输入系统序号 (默认 %d): ", defOSIdx), "")
 	finalOS := osList[defOSIdx-1]
 	if idx, err := strconv.Atoi(oIn); err == nil && idx > 0 && idx <= len(osList) { finalOS = osList[idx-1] }
+	
+	openAll := yes(input("是否全开防火墙端口 (TCP+UDP 0-65535)? [y/N]: ", "n"))
 	ud, _ := collectUserData("\n可选：UserData 脚本")
+	
 	fmt.Println("🚀 创建中...")
 	_, err = cli.CreateInstances(ctx, &lightsail.CreateInstancesInput{
 		AvailabilityZone: aws.String(az), BlueprintId: aws.String(finalOS), BundleId: aws.String(finalBundle),
 		InstanceNames: []string{name}, UserData: aws.String(ud),
 	})
-	if err != nil { fmt.Println("❌ 失败:", err); return }
-	fmt.Println("✅ 已提交")
+	if err != nil { 
+		fmt.Println("❌ 失败:", err)
+		return 
+	}
+	fmt.Println("✅ 实例创建指令已提交")
+
+	if openAll {
+		fmt.Println("⏳ 正在等待实例就绪以配置防火墙 (最多等待 60 秒)...")
+		// 轮询检查实例状态
+		ready := false
+		for i := 0; i < 30; i++ { // 30 * 2s = 60s
+			time.Sleep(2 * time.Second)
+			insOut, err := cli.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: aws.String(name)})
+			if err == nil && insOut.Instance != nil && insOut.Instance.State != nil {
+				state := aws.ToString(insOut.Instance.State.Name)
+				if state == "running" {
+					ready = true
+					break
+				}
+			}
+			fmt.Print(".")
+		}
+		fmt.Println("")
+
+		if ready {
+			fmt.Println("✅ 实例已就绪，正在开启端口...")
+			_, err := cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
+				InstanceName: aws.String(name),
+				PortInfos: []lst.PortInfo{
+					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolTcp},
+					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolUdp},
+				},
+			})
+			if err != nil {
+				fmt.Printf("⚠️ 防火墙配置失败: %v\n", err)
+			} else {
+				fmt.Println("✅ 防火墙规则已更新 (全开)")
+			}
+		} else {
+			fmt.Println("⚠️ 等待超时，实例尚未进入 Running 状态，请稍后手动配置防火墙。")
+		}
+	}
 }
 
 func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
 	rows, _ := lsListAll(ctx, regions, creds)
 	if len(rows) == 0 { fmt.Println("❌ 无实例"); return }
 	
-	// List View
 	printTable("序号\t区域\t名称\t状态\t配置\tIPv4\tIPv6", func(w *tabwriter.Writer) {
 		for _, r := range rows { fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", r.Idx, r.Region, r.Name, r.State, cut(r.Bundle, 10), r.IP, r.IPv6) }
 	})
@@ -515,15 +552,20 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 	cfg, _ := mkCfg(ctx, sel.Region, creds)
 	cli := lightsail.NewFromConfig(cfg)
 
-	// Detail View (Fetch full details)
+	// Detail View
 	fmt.Printf("\n🔍 正在获取 Lightsail 实例 %s 的详细指标...\n", sel.Name)
 	insOut, err := cli.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: &sel.Name})
+	
+	var isStaticIP bool = false
 	if err == nil && insOut.Instance != nil {
 		ins := insOut.Instance
+		isStaticIP = *ins.IsStaticIp // 记录是否为静态IP
+		
 		var ports []string
 		for _, p := range ins.Networking.Ports {
-			if p.FromPort == 0 && (p.Protocol == "all" || p.Protocol == "-1") {
-				ports = append(ports, "全部允许")
+			// 优化显示：0/tcp, 0/udp 或者 protocol=all 的情况
+			if (p.FromPort == 0 && p.ToPort == 65535) || (p.FromPort == 0 && (p.Protocol == "all" || p.Protocol == "-1")) {
+				ports = append(ports, fmt.Sprintf("全部允许 (%s)", p.Protocol))
 			} else {
 				ports = append(ports, fmt.Sprintf("%d/%s", p.FromPort, p.Protocol))
 			}
@@ -538,6 +580,11 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 		}
 		fmt.Printf(" 运行状态  : %s\n", *ins.State.Name)
 		fmt.Printf(" 公网 IPv4 : %s\n", sel.IP)
+		if isStaticIP {
+			fmt.Println(" IP 类型   : [固定IP/Static] ✅")
+		} else {
+			fmt.Println(" IP 类型   : [动态IP/Dynamic] (建议绑定固定 IP)")
+		}
 		fmt.Printf(" 私网 IPv4 : %s\n", *ins.PrivateIpAddress)
 		if sel.IPv6 != "" {
 			fmt.Printf(" IPv6 地址 : %s\n", sel.IPv6)
@@ -551,7 +598,7 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 		fmt.Println("================================================================")
 	}
 
-	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 删除\n", sel.Name)
+	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 删除 5) 管理固定 IP\n", sel.Name)
 	switch input("选择: ", "0") {
 	case "1": 
 		_, err := cli.StartInstance(ctx, &lightsail.StartInstanceInput{InstanceName: &sel.Name})
@@ -563,30 +610,100 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 		_, err := cli.RebootInstance(ctx, &lightsail.RebootInstanceInput{InstanceName: &sel.Name})
 		if err == nil { fmt.Println("✅ 重启中") } else { fmt.Println("❌ 失败:", err) }
 	case "4":
-		if yes(input("⚠️ 确认删除实例? [y/N]: ", "n")) {
-			// 检查并询问是否释放静态 IP
-			sipOut, err := cli.GetStaticIp(ctx, &lightsail.GetStaticIpInput{StaticIpName: aws.String("sip-" + sel.Name)})
-			// 如果按照 sip-实例名 找不到，尝试遍历 region 所有静态IP
-			if err != nil {
-				allSip, _ := cli.GetStaticIps(ctx, &lightsail.GetStaticIpsInput{})
+		if yes(input("⚠️ 确认删除实例 (删除)? [y/N]: ", "n")) {
+			// 1. Check and Release Static IP
+			fmt.Println("🔍 正在检查关联的固定 IP (Static IP)...")
+			allSip, err := cli.GetStaticIps(ctx, &lightsail.GetStaticIpsInput{})
+			if err == nil {
+				foundIp := false
 				for _, s := range allSip.StaticIps {
 					if s.AttachedTo != nil && *s.AttachedTo == sel.Name {
-						if yes(input(fmt.Sprintf("⚠️ 发现关联静态IP (%s)，是否释放? [y/N]: ", *s.Name), "n")) {
-							cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: s.Name})
-							fmt.Println("🗑️ IP 已释放")
+						foundIp = true
+						fmt.Printf("⚠️ 发现关联固定 IP (%s)，正在释放以防止扣费...\n", *s.Name)
+						_, err := cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: s.Name})
+						if err == nil {
+							fmt.Println("   ✅ IP 已释放")
+						} else {
+							fmt.Printf("   ❌ 释放失败: %v\n", err)
 						}
-						break
+						break 
 					}
 				}
-			} else if sipOut.StaticIp != nil {
-				if yes(input(fmt.Sprintf("⚠️ 发现关联静态IP (%s)，是否释放? [y/N]: ", *sipOut.StaticIp.Name), "n")) {
-					cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: sipOut.StaticIp.Name})
-					fmt.Println("🗑️ IP 已释放")
+				if !foundIp {
+					fmt.Println("   无关联固定 IP。")
 				}
 			}
 
+			// 2. Delete Instance
 			_, err = cli.DeleteInstance(ctx, &lightsail.DeleteInstanceInput{InstanceName: &sel.Name})
-			if err == nil { fmt.Println("🗑️ 实例删除中...") } else { fmt.Println("❌ 失败:", err) }
+			if err == nil { fmt.Println("🗑️ 实例删除指令已发送...") } else { fmt.Println("❌ 删除失败:", err) }
+		}
+	case "5":
+		// 管理固定 IP 逻辑 - 修复版
+		if isStaticIP {
+			fmt.Println("ℹ️  当前实例已绑定固定 IP。")
+			if yes(input("是否【解绑 (Detach)】该固定 IP? [y/N]: ", "n")) {
+				ipName := ""
+				allSip, _ := cli.GetStaticIps(ctx, &lightsail.GetStaticIpsInput{})
+				for _, s := range allSip.StaticIps {
+					if s.AttachedTo != nil && *s.AttachedTo == sel.Name {
+						ipName = *s.Name
+						break
+					}
+				}
+				if ipName != "" {
+					_, err := cli.DetachStaticIp(ctx, &lightsail.DetachStaticIpInput{StaticIpName: &ipName})
+					if err == nil {
+						fmt.Println("✅ 已解绑。")
+						fmt.Println("⚠️  注意：闲置的固定 IP 会产生费用！")
+						if yes(input(fmt.Sprintf("是否立即【释放 (Delete)】IP %s ? [y/N]: ", ipName), "n")) {
+							_, err := cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: &ipName})
+							if err == nil { fmt.Println("🗑️ IP 已释放 (无费用风险)") } else { fmt.Println("❌ 释放失败:", err) }
+						}
+					} else {
+						fmt.Println("❌ 解绑失败:", err)
+					}
+				} else {
+					fmt.Println("❌ 无法找到关联的 IP 名称")
+				}
+			}
+		} else {
+			fmt.Println("ℹ️  当前使用动态 IP。")
+			if yes(input("是否【创建并绑定】新的固定 IP? [y/N]: ", "n")) {
+				newIpName := fmt.Sprintf("Static-%s", sel.Name)
+				
+				// 1. 先检查该 IP 是否已存在
+				var ipExists bool = false
+				checkIp, err := cli.GetStaticIp(ctx, &lightsail.GetStaticIpInput{StaticIpName: aws.String(newIpName)})
+				if err == nil && checkIp.StaticIp != nil {
+					fmt.Printf("⚠️ 发现同名固定 IP (%s) 已存在，尝试直接绑定...\n", newIpName)
+					ipExists = true
+				} else {
+					// 2. 不存在，申请新 IP
+					fmt.Printf("正在申请新 IP (%s)...\n", newIpName)
+					_, err := cli.AllocateStaticIp(ctx, &lightsail.AllocateStaticIpInput{StaticIpName: &newIpName})
+					if err != nil {
+						fmt.Println("❌ 申请失败:", err)
+					} else {
+						fmt.Println("✅ IP 申请成功")
+						ipExists = true
+					}
+				}
+
+				// 3. 执行绑定
+				if ipExists {
+					fmt.Println("正在绑定...")
+					_, err := cli.AttachStaticIp(ctx, &lightsail.AttachStaticIpInput{
+						InstanceName: &sel.Name,
+						StaticIpName: &newIpName,
+					})
+					if err == nil {
+						fmt.Println("✅ 绑定成功！")
+					} else {
+						fmt.Println("❌ 绑定失败:", err)
+					}
+				}
+			}
 		}
 	}
 }
