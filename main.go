@@ -505,7 +505,6 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	}
 	var brs []bRow
 	
-	// >>>>>> 修改点：默认套餐设置为 nano_3_0 <<<<<<
 	targetBundleDefault := "nano_3_0" 
 	defaultBundleIdx := 1
 
@@ -811,15 +810,42 @@ RESELECT:
 				}
 				fmt.Printf(" - %s (IP: %s) -> %s\n", r.Name, r.IP, att)
 			}
-			sipName := input("请输入要删除的静态 IP 名称: ", "")
-			if sipName != "" {
-				lsDetachStaticIP(ctx, cli, sipName) // 尝试先解绑
-				time.Sleep(1 * time.Second)
-				opErr = lsReleaseStaticIP(ctx, cli, sipName)
-				if opErr == nil {
-					fmt.Println("✅ 已删除:", sipName)
-				}
+			p := mustInt(input("输入要删除(释放)的静态IP编号 IDX（0 取消）: ", "0"))
+			if p == 0 {
+				continue
 			}
+			if p < 1 || p > len(all) {
+				fmt.Println("❌ 编号无效")
+				continue
+			}
+			sip := all[p-1]
+
+			fmt.Println("⚠️ 删除静态IP不可逆：释放后该IP不再属于你")
+			if !yes(input("确认删除？[y/N]: ", "n")) {
+				fmt.Println("已取消")
+				continue
+			}
+
+			if sip.IsAttached {
+				fmt.Printf("该静态IP当前绑定到：%s\n", sip.AttachedTo)
+				if !yes(input("是否先解绑再释放？[y/N]: ", "n")) {
+					fmt.Println("已取消")
+					continue
+				}
+				fmt.Println("🔓 DetachStaticIp...")
+				if err := lsDetachStaticIP(ctx, cli, sip.Name); err != nil {
+					fmt.Println("❌ 解绑失败：", err)
+					continue
+				}
+				time.Sleep(2 * time.Second)
+			}
+
+			fmt.Println("🗑️ ReleaseStaticIp...")
+			opErr = lsReleaseStaticIP(ctx, cli, sip.Name)
+			if opErr == nil {
+				fmt.Println("✅ 已释放静态IP：", sip.Name)
+			}
+
 		case "9":
 			goto RESELECT
 		case "0":
@@ -990,8 +1016,7 @@ RESELECT:
 			_, opErr = cli.RebootInstances(ctx, &ec2.RebootInstancesInput{InstanceIds: []string{sel.ID}})
 		case "4":
 			fmt.Println("⚠️ 警告：终止实例是不可逆的！")
-			confirm := input("请输入 DELETE 以确认删除: ", "")
-			if confirm == "DELETE" {
+			if yes(input("确认删除？[y/N]: ", "n")) {
 				fmt.Println("🗑️ 正在终止...")
 				_, opErr = cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
 			} else {
