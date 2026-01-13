@@ -1058,7 +1058,7 @@ service ssh restart
 
 func main() {
 	ctx := context.Background()
-	fmt.Println("=== AWS 管理工具 (Win/Linux通用) ===")
+	fmt.Println("=== AWS 管理工具 (Win) ===")
 	
 	ak := input("AWS Access Key ID: ", "")
 	sk := inputSecret("AWS Secret Access Key: ")
