@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -36,13 +38,15 @@ import (
 )
 
 /*
-AWS Manager (Go) - 精简版 ($80 任务)
-- 移除了 Bedrock AI 任务
-- 包含完整区域映射
-- 自动完成剩余 4 个新手任务 ($80 奖励)
+AWS Manager (Go) - 代理选择版
+- 启动时明确选择：1.直连 / 2.代理
+- 包含 $80 任务自动化
+- 包含完整 EC2/Lightsail 管理
 */
 
 const bootstrapRegion = "us-east-1"
+
+var GlobalProxy string
 
 // --- 数据结构 ---
 
@@ -88,42 +92,39 @@ type TypeOption struct {
 
 // -------------------- UI/辅助函数 --------------------
 
+func parseProxyString(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		return raw
+	}
+	parts := strings.Split(raw, ":")
+	if len(parts) == 2 {
+		return fmt.Sprintf("socks5://%s:%s", parts[0], parts[1])
+	}
+	if len(parts) == 4 {
+		userInfo := url.UserPassword(parts[2], parts[3]).String()
+		return fmt.Sprintf("socks5://%s@%s:%s", userInfo, parts[0], parts[1])
+	}
+	return raw
+}
+
 func regionCN(region string) string {
 	m := map[string]string{
-		"af-south-1":     "南非·开普敦",
-		"ap-east-1":      "中国·香港",
-		"ap-east-2":      "中国·台湾",
-		"ap-northeast-1": "日本·东京",
-		"ap-northeast-2": "韩国·首尔",
-		"ap-northeast-3": "日本·大阪",
-		"ap-south-1":     "印度·孟买",
-		"ap-south-2":     "印度·海得拉巴",
-		"ap-southeast-1": "新加坡",
-		"ap-southeast-2": "澳大利亚·悉尼",
-		"ap-southeast-3": "印度尼西亚·雅加达",
-		"ap-southeast-4": "澳大利亚·墨尔本",
-		"ap-southeast-5": "马来西亚·吉隆坡",
-		"ap-southeast-6": "亚太·其他",
-		"ap-southeast-7": "泰国·曼谷",
-		"ca-central-1":   "加拿大·中部",
-		"ca-west-1":      "加拿大·卡尔加里",
-		"eu-central-1":   "德国·法兰克福",
-		"eu-central-2":   "瑞士·苏黎世",
-		"eu-north-1":     "瑞典·斯德哥尔摩",
-		"eu-south-1":     "意大利·米兰",
-		"eu-south-2":     "西班牙·马德里",
-		"eu-west-1":      "爱尔兰·都柏林",
-		"eu-west-2":      "英国·伦敦",
-		"eu-west-3":      "法国·巴黎",
-		"il-central-1":   "以色列·特拉维夫",
-		"me-central-1":   "阿联酋·阿布扎比",
-		"me-south-1":     "巴林",
-		"mx-central-1":   "墨西哥·中心",
-		"sa-east-1":      "巴西·圣保罗",
-		"us-east-1":      "美国东部·弗吉尼亚",
-		"us-east-2":      "美国东部·俄亥俄",
-		"us-west-1":      "美国西部·加州(北)",
-		"us-west-2":      "美国西部·俄勒冈",
+		"af-south-1": "南非·开普敦", "ap-east-1": "中国·香港", "ap-east-2": "中国·台湾",
+		"ap-northeast-1": "日本·东京", "ap-northeast-2": "韩国·首尔", "ap-northeast-3": "日本·大阪",
+		"ap-south-1": "印度·孟买", "ap-south-2": "印度·海得拉巴", "ap-southeast-1": "新加坡",
+		"ap-southeast-2": "澳大利亚·悉尼", "ap-southeast-3": "印度尼西亚·雅加达", "ap-southeast-4": "澳大利亚·墨尔本",
+		"ap-southeast-5": "马来西亚·吉隆坡", "ap-southeast-6": "亚太·其他", "ap-southeast-7": "泰国·曼谷",
+		"ca-central-1": "加拿大·中部", "ca-west-1": "加拿大·卡尔加里", "eu-central-1": "德国·法兰克福",
+		"eu-central-2": "瑞士·苏黎世", "eu-north-1": "瑞典·斯德哥尔摩", "eu-south-1": "意大利·米兰",
+		"eu-south-2": "西班牙·马德里", "eu-west-1": "爱尔兰·都柏林", "eu-west-2": "英国·伦敦",
+		"eu-west-3": "法国·巴黎", "il-central-1": "以色列·特拉维夫", "me-central-1": "阿联酋·阿布扎比",
+		"me-south-1": "巴林", "mx-central-1": "墨西哥·中心", "sa-east-1": "巴西·圣保罗",
+		"us-east-1": "美国东部·弗吉尼亚", "us-east-2": "美国东部·俄亥俄", "us-west-1": "美国西部·加州(北)",
+		"us-west-2": "美国西部·俄勒冈",
 	}
 	if v, ok := m[region]; ok {
 		return v
@@ -199,11 +200,21 @@ func collectUserData(promptTitle string) (raw string, isEmpty bool) {
 }
 
 func mkCfg(ctx context.Context, region string, creds aws.CredentialsProvider) (aws.Config, error) {
-	return config.LoadDefaultConfig(
-		ctx,
+	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
 		config.WithCredentialsProvider(creds),
-	)
+	}
+	if GlobalProxy != "" {
+		proxyURL, err := url.Parse(GlobalProxy)
+		if err == nil {
+			httpClient := &http.Client{
+				Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+				Timeout:   30 * time.Second,
+			}
+			opts = append(opts, config.WithHTTPClient(httpClient))
+		}
+	}
+	return config.LoadDefaultConfig(ctx, opts...)
 }
 
 func stsCheck(ctx context.Context, region string, creds aws.CredentialsProvider) error {
@@ -275,16 +286,13 @@ func printTable(header string, rowsFunc func(*tabwriter.Writer)) {
 	w.Flush()
 }
 
-// -------------------- 自动化获取 $80 奖励任务逻辑 --------------------
+// -------------------- 2. 自动化 $80 任务逻辑 --------------------
 
-// 任务 1: 设置预算 ($20)
 func taskSetBudget(ctx context.Context, cfg aws.Config, acctID string) {
 	fmt.Println("\n[任务 1/4] 正在设置 AWS Cost Budget (成本预算)...")
 	cli := budgets.NewFromConfig(cfg)
-	// 随机名防止重复
 	budgetName := fmt.Sprintf("AutoBudget-%s", randStr(6))
 	email := fmt.Sprintf("alert-%s@example.com", randStr(4))
-
 	_, err := cli.CreateBudget(ctx, &budgets.CreateBudgetInput{
 		AccountId: aws.String(acctID),
 		Budget: &budgetsTypes.Budget{
@@ -300,31 +308,25 @@ func taskSetBudget(ctx context.Context, cfg aws.Config, acctID string) {
 					ComparisonOperator: budgetsTypes.ComparisonOperatorGreaterThan,
 					Threshold:          80.0,
 				},
-				Subscribers: []budgetsTypes.Subscriber{
-					{SubscriptionType: budgetsTypes.SubscriptionTypeEmail, Address: aws.String(email)},
-				},
+				Subscribers: []budgetsTypes.Subscriber{{SubscriptionType: budgetsTypes.SubscriptionTypeEmail, Address: aws.String(email)}},
 			},
 		},
 	})
-
 	if err != nil {
 		if strings.Contains(err.Error(), "Duplicate") {
 			fmt.Println(" ✅ 预算已存在，跳过。")
 		} else {
-			fmt.Printf(" ❌ 失败: %v (请检查权限)\n", err)
+			fmt.Printf(" ❌ 失败: %v\n", err)
 		}
 	} else {
-		fmt.Printf(" ✅ 预算 [%s] 创建成功 (通知邮箱: %s)\n", budgetName, email)
+		fmt.Printf(" ✅ 预算 [%s] 创建成功\n", budgetName)
 	}
 }
 
-// 任务 2: 启动并删除 EC2 ($20)
 func taskRunEC2(ctx context.Context, cfg aws.Config) {
-	fmt.Println("\n[任务 2/4] 正在启动 EC2 实例并等待运行...")
+	fmt.Println("\n[任务 2/4] 正在启动 EC2 实例...")
 	cli := ec2.NewFromConfig(cfg)
-	// Amazon Linux 2023 (us-east-1)
 	ami := "ami-051f7e7f6c2f40dc1"
-
 	runOut, err := cli.RunInstances(ctx, &ec2.RunInstancesInput{
 		ImageId:      aws.String(ami),
 		InstanceType: ec2t.InstanceTypeT3Nano,
@@ -336,31 +338,26 @@ func taskRunEC2(ctx context.Context, cfg aws.Config) {
 		return
 	}
 	id := *runOut.Instances[0].InstanceId
-	fmt.Printf(" ⏳ 实例 %s 正在启动，等待状态变为 Running...\n", id)
-
+	fmt.Printf(" ⏳ 实例 %s 启动中，等待 Running...\n", id)
 	for i := 0; i < 40; i++ {
 		time.Sleep(3 * time.Second)
 		desc, _ := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{id}})
 		if len(desc.Reservations) > 0 && desc.Reservations[0].Instances[0].State.Name == ec2t.InstanceStateNameRunning {
-			fmt.Println(" ✅ 状态已变更为 Running！任务达成。")
+			fmt.Println(" ✅ 状态: Running (任务达成)")
 			break
 		}
 		fmt.Print(".")
 	}
-
-	fmt.Println(" 🗑️ 正在终止实例以避免扣费...")
+	fmt.Println(" 🗑️ 正在终止实例...")
 	cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{id}})
-	fmt.Println(" ✅ 实例已终止。")
+	fmt.Println(" ✅ 实例已终止")
 }
 
-// 任务 3: 创建并删除 Lambda ($20)
 func taskRunLambda(ctx context.Context, cfg aws.Config) {
 	fmt.Println("\n[任务 3/4] 正在创建并调用 Lambda 函数...")
-	// 1. 创建 IAM Role
 	iamCli := iam.NewFromConfig(cfg)
 	roleName := fmt.Sprintf("AutoLambdaRole-%s", randStr(5))
 	assumeRolePolicy := `{"Version": "2012-10-17","Statement": [{"Effect": "Allow","Principal": {"Service": "lambda.amazonaws.com"},"Action": "sts:AssumeRole"}]}`
-
 	fmt.Printf(" -> 创建临时 IAM 角色: %s\n", roleName)
 	roleOut, err := iamCli.CreateRole(ctx, &iam.CreateRoleInput{
 		RoleName:                 aws.String(roleName),
@@ -371,12 +368,10 @@ func taskRunLambda(ctx context.Context, cfg aws.Config) {
 		return
 	}
 	roleArn := *roleOut.Role.Arn
-
 	fmt.Print(" ⏳ 等待 IAM 角色生效 (约10秒)...")
 	time.Sleep(10 * time.Second)
 	fmt.Println("")
 
-	// 2. 准备代码
 	code := `def lambda_handler(event, context): return "Hello AWS 80 USD"`
 	buf := new(bytes.Buffer)
 	zipWriter := zip.NewWriter(buf)
@@ -384,10 +379,8 @@ func taskRunLambda(ctx context.Context, cfg aws.Config) {
 	f.Write([]byte(code))
 	zipWriter.Close()
 
-	// 3. 创建函数
 	lambdaCli := lambda.NewFromConfig(cfg)
 	funcName := fmt.Sprintf("AutoFunc-%s", randStr(5))
-
 	_, err = lambdaCli.CreateFunction(ctx, &lambda.CreateFunctionInput{
 		FunctionName: aws.String(funcName),
 		Runtime:      lambdaTypes.RuntimePython39,
@@ -395,8 +388,6 @@ func taskRunLambda(ctx context.Context, cfg aws.Config) {
 		Handler:      aws.String("lambda_function.lambda_handler"),
 		Code:         &lambdaTypes.FunctionCode{ZipFile: buf.Bytes()},
 	})
-
-	// 重试逻辑 (处理 IAM 延迟)
 	if err != nil {
 		time.Sleep(5 * time.Second)
 		_, err = lambdaCli.CreateFunction(ctx, &lambda.CreateFunctionInput{
@@ -413,8 +404,6 @@ func taskRunLambda(ctx context.Context, cfg aws.Config) {
 		}
 	}
 	fmt.Printf(" ✅ 函数 %s 创建成功，正在初始化...\n", funcName)
-
-	// --- 等待函数状态变为 Active ---
 	fmt.Print(" ⏳ 等待函数就绪 (Pending -> Active)")
 	for i := 0; i < 30; i++ {
 		fOut, err := lambdaCli.GetFunction(ctx, &lambda.GetFunctionInput{FunctionName: aws.String(funcName)})
@@ -425,32 +414,24 @@ func taskRunLambda(ctx context.Context, cfg aws.Config) {
 		time.Sleep(2 * time.Second)
 		fmt.Print(".")
 	}
-	// ---------------------------------------
-
-	// 4. 调用
 	_, err = lambdaCli.Invoke(ctx, &lambda.InvokeInput{FunctionName: aws.String(funcName)})
 	if err == nil {
 		fmt.Println(" ✅ 调用成功！任务达成。")
 	} else {
 		fmt.Printf(" ❌ 调用失败: %v\n", err)
 	}
-
-	// 5. 清理
-	fmt.Println(" 🗑️ 清理资源 (函数 & 角色)...")
+	fmt.Println(" 🗑️ 清理资源...")
 	lambdaCli.DeleteFunction(ctx, &lambda.DeleteFunctionInput{FunctionName: aws.String(funcName)})
 	iamCli.DeleteRole(ctx, &iam.DeleteRoleInput{RoleName: aws.String(roleName)})
 }
 
-// 任务 4: 创建并删除 RDS ($20)
 func taskRunRDS(ctx context.Context, cfg aws.Config) {
 	fmt.Println("\n[任务 4/4] 正在创建 RDS 数据库 (MySQL Free Tier)...")
 	fmt.Println("⚠️ 警告：RDS 创建非常慢 (5-10 分钟)，请耐心等待。")
-
 	rdsCli := rds.NewFromConfig(cfg)
 	dbName := fmt.Sprintf("db-%s", randStr(6))
 	masterUser := "admin"
 	masterPass := "Password123456"
-
 	_, err := rdsCli.CreateDBInstance(ctx, &rds.CreateDBInstanceInput{
 		DBInstanceIdentifier:  aws.String(dbName),
 		DBInstanceClass:       aws.String("db.t3.micro"),
@@ -460,19 +441,15 @@ func taskRunRDS(ctx context.Context, cfg aws.Config) {
 		AllocatedStorage:      aws.Int32(20),
 		BackupRetentionPeriod: aws.Int32(0),
 	})
-
 	if err != nil {
 		fmt.Printf(" ❌ 创建请求失败: %v\n", err)
 		return
 	}
-	fmt.Printf(" ⏳ 数据库 %s 正在创建，进入轮询等待模式...\n", dbName)
-
+	fmt.Printf(" ⏳ 数据库 %s 正在创建...\n", dbName)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
-	maxWait := 30 // 15 mins
+	maxWait := 30
 	created := false
-
 	for i := 0; i < maxWait; i++ {
 		<-ticker.C
 		out, err := rdsCli.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{
@@ -492,42 +469,34 @@ func taskRunRDS(ctx context.Context, cfg aws.Config) {
 			}
 		}
 	}
-
 	if created {
-		fmt.Println(" 🗑️ 正在立即删除数据库以防止扣费...")
+		fmt.Println(" 🗑️ 正在删除数据库...")
 		_, err := rdsCli.DeleteDBInstance(ctx, &rds.DeleteDBInstanceInput{
 			DBInstanceIdentifier: aws.String(dbName),
 			SkipFinalSnapshot:    aws.Bool(true),
 		})
 		if err != nil {
-			fmt.Printf(" ❌ 删除失败: %v (请务必手动去控制台删除！)\n", err)
+			fmt.Printf(" ❌ 删除失败: %v\n", err)
 		} else {
 			fmt.Println(" ✅ 删除指令已发送。")
 		}
 	} else {
-		fmt.Println("\n ⚠️ 等待超时，数据库可能仍在创建中。")
-		fmt.Printf(" ⚠️ 请稍后务必去 RDS 控制台手动删除 [%s]！\n", dbName)
+		fmt.Println("\n ⚠️ 等待超时，数据库可能仍在创建中。请稍后务必手动删除！")
 	}
 }
 
-// 自动刷分主流程 - $80 版
 func autoClaimCredits(ctx context.Context, creds aws.CredentialsProvider) {
 	fmt.Println("\n====== 💰 自动执行 AWS 新手任务 (赚取 $80 抵扣金) ======")
-	fmt.Println("区域：强制使用 us-east-1 (确保兼容性)")
-	fmt.Println("移除：Bedrock AI 任务 (因需手动开通权限)")
-	
+	fmt.Println("区域：强制使用 us-east-1")
 	fmt.Println("\n请选择模式:")
-	fmt.Println(" 1) 全自动 (跑完所有 4 个任务，耗时约 10 分钟)")
-	fmt.Println(" 2) 自选任务 (只跑特定的任务)")
+	fmt.Println(" 1) 全自动 (跑完所有 4 个任务)")
+	fmt.Println(" 2) 自选任务")
 	mode := input("选择 [1]: ", "1")
-
 	cfg, err := mkCfg(ctx, "us-east-1", creds)
 	if err != nil {
 		fmt.Println("初始化配置失败:", err)
 		return
 	}
-
-	// 获取 Account ID
 	stsCli := sts.NewFromConfig(cfg)
 	idOut, err := stsCli.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
@@ -535,7 +504,6 @@ func autoClaimCredits(ctx context.Context, creds aws.CredentialsProvider) {
 		return
 	}
 	acctID := *idOut.Account
-
 	if mode == "1" {
 		taskSetBudget(ctx, cfg, acctID)
 		taskRunEC2(ctx, cfg)
@@ -544,31 +512,36 @@ func autoClaimCredits(ctx context.Context, creds aws.CredentialsProvider) {
 	} else {
 		for {
 			fmt.Println("\n--- 任务选择 ---")
-			fmt.Println(" 1. 设置预算 (Budget)")
+			fmt.Println(" 1. 设置预算")
 			fmt.Println(" 2. 启动 EC2")
 			fmt.Println(" 3. 运行 Lambda")
-			fmt.Println(" 4. 创建 RDS (数据库)")
-			fmt.Println(" 0. 返回主菜单")
+			fmt.Println(" 4. 创建 RDS")
+			fmt.Println(" 0. 返回")
 			t := input("请输入任务编号: ", "0")
-			if t == "0" { break }
-			
+			if t == "0" {
+				break
+			}
 			switch t {
-			case "1": taskSetBudget(ctx, cfg, acctID)
-			case "2": taskRunEC2(ctx, cfg)
-			case "3": taskRunLambda(ctx, cfg)
-			case "4": taskRunRDS(ctx, cfg)
-			default: fmt.Println("无效选项")
+			case "1":
+				taskSetBudget(ctx, cfg, acctID)
+			case "2":
+				taskRunEC2(ctx, cfg)
+			case "3":
+				taskRunLambda(ctx, cfg)
+			case "4":
+				taskRunRDS(ctx, cfg)
+			default:
+				fmt.Println("无效选项")
 			}
 		}
 	}
-
 	if mode == "1" {
 		fmt.Println("\n====== 🎉 所有流程执行完毕 ======")
 		input("按回车键返回主菜单...", "")
 	}
 }
 
-// -------------------- Regions 获取与启用 --------------------
+// -------------------- 3. AWS 功能函数 (EC2, Lightsail) --------------------
 
 func getEC2RegionsWithStatus(ctx context.Context, creds aws.CredentialsProvider) ([]RegionInfo, error) {
 	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
@@ -576,19 +549,14 @@ func getEC2RegionsWithStatus(ctx context.Context, creds aws.CredentialsProvider)
 		return nil, err
 	}
 	cli := ec2.NewFromConfig(cfg)
-	out, err := cli.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
-		AllRegions: aws.Bool(true),
-	})
+	out, err := cli.DescribeRegions(ctx, &ec2.DescribeRegionsInput{AllRegions: aws.Bool(true)})
 	if err != nil {
 		return nil, err
 	}
 	var rs []RegionInfo
 	for _, r := range out.Regions {
 		if r.RegionName != nil && *r.RegionName != "" {
-			rs = append(rs, RegionInfo{
-				Name:   *r.RegionName,
-				Status: aws.ToString(r.OptInStatus),
-			})
+			rs = append(rs, RegionInfo{Name: *r.RegionName, Status: aws.ToString(r.OptInStatus)})
 		}
 	}
 	sort.Slice(rs, func(i, j int) bool { return rs[i].Name < rs[j].Name })
@@ -620,27 +588,22 @@ func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, cr
 	if currentStatus == "opt-in-not-required" || currentStatus == "opted-in" {
 		return nil
 	}
-	fmt.Printf("\n⚠️  检测到区域 %s 当前状态为 [%s] (未启用)\n", regionName, currentStatus)
-	fmt.Println("注意：启用区域是 AWS 账户级别的操作，通常需要 5~20 分钟生效。")
-	if !yes(input("是否立即发起启用请求并等待？[y/N]: ", "n")) {
-		return fmt.Errorf("用户取消操作")
+	fmt.Printf("\n⚠️  检测到区域 %s 未启用\n", regionName)
+	if !yes(input("是否启用？[y/N]: ", "n")) {
+		return fmt.Errorf("取消")
 	}
 	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
 	if err != nil {
 		return err
 	}
 	acctCli := account.NewFromConfig(cfg)
-	fmt.Printf("🚀 正在调用 EnableRegion (%s)...\n", regionName)
-	_, err = acctCli.EnableRegion(ctx, &account.EnableRegionInput{
-		RegionName: aws.String(regionName),
-	})
+	_, err = acctCli.EnableRegion(ctx, &account.EnableRegionInput{RegionName: aws.String(regionName)})
 	if err != nil {
 		if !strings.Contains(err.Error(), "ResourceAlreadyExists") && !strings.Contains(err.Error(), "Region is enabled") {
-			return fmt.Errorf("启用请求失败: %v", err)
+			return fmt.Errorf("失败: %v", err)
 		}
 	}
-	fmt.Println("⏳ 请求已发送，进入等待模式 (每 15 秒检查一次)...")
-	fmt.Println("提示：您可以按 Ctrl+C 中止等待，稍后再试。")
+	fmt.Println("⏳ 请求已发送...")
 	ec2Cli := ec2.NewFromConfig(cfg)
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -665,45 +628,320 @@ func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, cr
 	}
 }
 
-// -------------------- 配额查询 --------------------
-
 func checkQuotas(ctx context.Context, creds aws.CredentialsProvider) {
-	region := "us-east-1"
-	cfg, err := mkCfg(ctx, region, creds)
+	cfg, err := mkCfg(ctx, "us-east-1", creds)
 	if err != nil {
-		fmt.Println("❌ 初始化失败：", err)
+		fmt.Println("❌ 失败:", err)
 		return
 	}
 	fmt.Println("\n正在查询.....")
 	sqCli := servicequotas.NewFromConfig(cfg)
-	vcpuQuotaCode := "L-1216C47A"
-	vcpuServiceCode := "ec2"
-	fmt.Print("🔍 查询 EC2 vCPU 配额... ")
-	qOut, err := sqCli.GetServiceQuota(ctx, &servicequotas.GetServiceQuotaInput{
-		ServiceCode: &vcpuServiceCode,
-		QuotaCode:   &vcpuQuotaCode,
-	})
+	vcpuCode := "L-1216C47A"
+	svcCode := "ec2"
+	qOut, err := sqCli.GetServiceQuota(ctx, &servicequotas.GetServiceQuotaInput{ServiceCode: &svcCode, QuotaCode: &vcpuCode})
 	if err != nil {
-		fmt.Printf("失败: %v\n", err)
+		fmt.Printf("EC2配额: 失败\n")
 	} else {
-		val := 0.0
-		if qOut.Quota != nil && qOut.Quota.Value != nil {
-			val = *qOut.Quota.Value
-		}
-		fmt.Printf("✅ %.0f vCPU\n", val)
+		fmt.Printf("EC2配额: %.0f vCPU\n", *qOut.Quota.Value)
 	}
-	fmt.Print("🔍 查询 Lightsail 状态... ")
-	lsCli := lightsail.NewFromConfig(cfg)
-	_, lsErr := lsCli.GetInstances(ctx, &lightsail.GetInstancesInput{})
-	if lsErr != nil {
-		fmt.Printf("❌ 访问受限: %v\n", lsErr)
-	} else {
-		fmt.Println("✅ 服务正常")
-	}
-	input("\n按回车键返回主菜单...", "")
+	input("\n按回车返回...", "")
 }
 
-// -------------------- Lightsail --------------------
+func autoSetupIPv6(ctx context.Context, cli *ec2.Client, region, vpcID string) (string, error) {
+	fmt.Println("🔍 配置 IPv6...")
+	vpcOut, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{VpcIds: []string{vpcID}})
+	if err != nil {
+		return "", err
+	}
+	hasVpcIPv6 := false
+	var vpcCidrBlock string
+	for _, assoc := range vpcOut.Vpcs[0].Ipv6CidrBlockAssociationSet {
+		if assoc.Ipv6CidrBlockState.State == ec2t.VpcCidrBlockStateCodeAssociated {
+			hasVpcIPv6 = true
+			vpcCidrBlock = *assoc.Ipv6CidrBlock
+			break
+		}
+	}
+	if !hasVpcIPv6 {
+		_, err := cli.AssociateVpcCidrBlock(ctx, &ec2.AssociateVpcCidrBlockInput{
+			VpcId: aws.String(vpcID), AmazonProvidedIpv6CidrBlock: aws.Bool(true),
+		})
+		if err != nil {
+			return "", err
+		}
+		fmt.Println("   -> 申请 VPC IPv6 成功")
+		for i := 0; i < 10; i++ {
+			time.Sleep(3 * time.Second)
+			v, _ := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{VpcIds: []string{vpcID}})
+			for _, a := range v.Vpcs[0].Ipv6CidrBlockAssociationSet {
+				if a.Ipv6CidrBlockState.State == ec2t.VpcCidrBlockStateCodeAssociated {
+					vpcCidrBlock = *a.Ipv6CidrBlock
+					goto VPC_READY
+				}
+			}
+		}
+		return "", fmt.Errorf("超时")
+	}
+VPC_READY:
+	subOut, err := cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
+	if err != nil || len(subOut.Subnets) == 0 {
+		return "", fmt.Errorf("无子网")
+	}
+	subnetID := *subOut.Subnets[0].SubnetId
+	newSubnetCidr := strings.Replace(vpcCidrBlock, "/56", "/64", 1)
+	cli.AssociateSubnetCidrBlock(ctx, &ec2.AssociateSubnetCidrBlockInput{SubnetId: aws.String(subnetID), Ipv6CidrBlock: aws.String(newSubnetCidr)})
+	cli.ModifySubnetAttribute(ctx, &ec2.ModifySubnetAttributeInput{
+		SubnetId: aws.String(subnetID), AssignIpv6AddressOnCreation: &ec2t.AttributeBooleanValue{Value: aws.Bool(true)},
+	})
+	// Route
+	rtOut, err := cli.DescribeRouteTables(ctx, &ec2.DescribeRouteTablesInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
+	if err == nil && len(rtOut.RouteTables) > 0 {
+		rt := rtOut.RouteTables[0]
+		hasRoute := false
+		var igwID string
+		igwOut, _ := cli.DescribeInternetGateways(ctx, &ec2.DescribeInternetGatewaysInput{Filters: []ec2t.Filter{{Name: aws.String("attachment.vpc-id"), Values: []string{vpcID}}}})
+		if len(igwOut.InternetGateways) > 0 {
+			igwID = *igwOut.InternetGateways[0].InternetGatewayId
+		}
+		for _, r := range rt.Routes {
+			if aws.ToString(r.DestinationIpv6CidrBlock) == "::/0" {
+				hasRoute = true
+				break
+			}
+		}
+		if !hasRoute && igwID != "" {
+			cli.CreateRoute(ctx, &ec2.CreateRouteInput{
+				RouteTableId: rt.RouteTableId, DestinationIpv6CidrBlock: aws.String("::/0"), GatewayId: aws.String(igwID),
+			})
+		}
+	}
+	return subnetID, nil
+}
+
+func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (string, string, error) {
+	vpcs, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{Filters: []ec2t.Filter{{Name: aws.String("isDefault"), Values: []string{"true"}}}})
+	if err != nil || len(vpcs.Vpcs) == 0 {
+		return "", "", fmt.Errorf("无默认VPC")
+	}
+	vpcID := *vpcs.Vpcs[0].VpcId
+	sgName := "open-all-ports"
+	sgs, _ := cli.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
+		Filters: []ec2t.Filter{{Name: aws.String("group-name"), Values: []string{sgName}}, {Name: aws.String("vpc-id"), Values: []string{vpcID}}},
+	})
+	if len(sgs.SecurityGroups) > 0 {
+		return *sgs.SecurityGroups[0].GroupId, vpcID, nil
+	}
+	res, err := cli.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{GroupName: aws.String(sgName), Description: aws.String("Auto generated"), VpcId: aws.String(vpcID)})
+	if err != nil {
+		return "", vpcID, err
+	}
+	cli.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId: res.GroupId,
+		IpPermissions: []ec2t.IpPermission{
+			{IpProtocol: aws.String("-1"), IpRanges: []ec2t.IpRange{{CidrIp: aws.String("0.0.0.0/0")}}},
+			{IpProtocol: aws.String("-1"), Ipv6Ranges: []ec2t.Ipv6Range{{CidrIpv6: aws.String("::/0")}}},
+		},
+	})
+	return *res.GroupId, vpcID, nil
+}
+
+func getLatestAMI(ctx context.Context, cli *ec2.Client, owner, namePattern string) string {
+	out, err := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{
+		Owners: []string{owner},
+		Filters: []ec2t.Filter{
+			{Name: aws.String("name"), Values: []string{namePattern}},
+			{Name: aws.String("architecture"), Values: []string{"x86_64"}},
+			{Name: aws.String("virtualization-type"), Values: []string{"hvm"}},
+		},
+	})
+	if err != nil || len(out.Images) == 0 {
+		return ""
+	}
+	sort.Slice(out.Images, func(i, j int) bool { return *out.Images[i].CreationDate > *out.Images[j].CreationDate })
+	return *out.Images[0].ImageId
+}
+
+func getLatestAMIWithArch(ctx context.Context, cli *ec2.Client, owner, namePattern, arch string) string {
+	out, err := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{
+		Owners: []string{owner},
+		Filters: []ec2t.Filter{
+			{Name: aws.String("name"), Values: []string{namePattern}},
+			{Name: aws.String("architecture"), Values: []string{arch}},
+			{Name: aws.String("virtualization-type"), Values: []string{"hvm"}},
+		},
+	})
+	if err != nil || len(out.Images) == 0 {
+		return ""
+	}
+	sort.Slice(out.Images, func(i, j int) bool { return *out.Images[i].CreationDate > *out.Images[j].CreationDate })
+	return *out.Images[0].ImageId
+}
+
+func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsProvider) {
+	fmt.Println("\n请选择 CPU 架构:")
+	fmt.Println("  1) x86_64 (Intel/AMD) [默认]")
+	fmt.Println("  2) arm64 (Graviton)")
+	archSel := input("请输入编号 [1]: ", "1")
+	targetArch := "x86_64"
+	if archSel == "2" {
+		targetArch = "arm64"
+	}
+
+	regionInfo, err := pickRegion("\n选择 EC2 Region：", regions, "us-east-1")
+	if err != nil {
+		return
+	}
+	if err := ensureRegionOptIn(ctx, regionInfo.Name, regionInfo.Status, creds); err != nil {
+		fmt.Println("❌ 区域不可用:", err)
+		return
+	}
+	region := regionInfo.Name
+	cfg, _ := mkCfg(ctx, region, creds)
+	cli := ec2.NewFromConfig(cfg)
+
+	// AMI List
+	amiList := []AMIOption{
+		{"Debian 12", "136693071363", "debian-12-*"},
+		{"Debian 11", "136693071363", "debian-11-*"},
+		{"Ubuntu 24.04", "099720109477", "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-*"},
+		{"Ubuntu 22.04", "099720109477", "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-*"},
+		{"Amazon Linux 2023", "137112412989", "al2023-ami-2023.*"},
+		{"Amazon Linux 2", "137112412989", "amzn2-ami-hvm-*"},
+	}
+
+	fmt.Printf("\n请选择操作系统 (%s):\n", targetArch)
+	for i, a := range amiList {
+		fmt.Printf("  %2d) %s\n", i+1, a.Name)
+	}
+	fmt.Println("  99) 自定义 AMI ID")
+
+	var ami string
+	sel := input("请输入编号 [1]: ", "1")
+	if sel == "99" {
+		ami = input("请输入 AMI ID: ", "")
+	} else {
+		idx := mustInt(sel)
+		if idx > 0 && idx <= len(amiList) {
+			target := amiList[idx-1]
+			fmt.Printf("🔍 正在搜索 %s (%s) 的最新镜像...\n", target.Name, targetArch)
+			ami = getLatestAMIWithArch(ctx, cli, target.Owner, target.Pattern, targetArch)
+		} else {
+			fmt.Println("❌ 编号无效")
+			return
+		}
+	}
+	if ami == "" {
+		fmt.Println("❌ 未找到 AMI")
+		return
+	}
+	fmt.Println("✅ 选中 AMI:", ami)
+
+	// Type
+	var typeList []TypeOption
+	if targetArch == "x86_64" {
+		typeList = []TypeOption{{"t2.nano", "1 vCPU, 0.5 GiB"}, {"t2.micro", "1 vCPU, 1.0 GiB"}, {"t3.micro", "2 vCPU, 1.0 GiB"}}
+	} else {
+		typeList = []TypeOption{{"t4g.nano", "2 vCPU, 0.5 GiB"}, {"t4g.micro", "2 vCPU, 1.0 GiB"}}
+	}
+	fmt.Printf("\n请选择实例类型:\n")
+	for i, t := range typeList {
+		fmt.Printf("  %2d) %s\n", i+1, t.Type)
+	}
+	var itype string
+	tSel := input("编号 [1]: ", "1")
+	idx := mustInt(tSel)
+	if idx > 0 && idx <= len(typeList) {
+		itype = typeList[idx-1].Type
+	} else {
+		itype = typeList[0].Type
+	}
+
+	count := int32(mustInt(input("启动数量 [1]: ", "1")))
+	if count < 1 {
+		count = 1
+	}
+	volSize := int32(mustInt(input("磁盘大小(GB) [默认]: ", "0")))
+	enableIPv6 := yes(input("自动分配 IPv6? [y/N]: ", "n"))
+	rootPwd := input("设置 SSH root 密码 (留空跳过): ", "")
+	openAll := yes(input("全开端口 (安全组)? [y/N]: ", "n"))
+
+	rawUD, empty := collectUserData("\n可选：EC2 启动脚本")
+	userData := ""
+	if rootPwd != "" {
+		userData = fmt.Sprintf("#!/bin/bash\necho \"root:%s\" | chpasswd\n", rootPwd)
+		userData += "sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config\n"
+		userData += "sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config\n"
+		userData += "service sshd restart\n"
+		if !empty {
+			userData += "\n" + rawUD
+		}
+	} else if !empty {
+		userData = rawUD
+	}
+
+	var sgID, vpcID string
+	if openAll || enableIPv6 {
+		s, v, err := ensureOpenAllSG(ctx, cli, region)
+		if err != nil {
+			fmt.Println("❌ 网络错误:", err)
+			return
+		}
+		sgID = s
+		vpcID = v
+	}
+
+	var targetSubnetID string
+	if enableIPv6 {
+		sID, err := autoSetupIPv6(ctx, cli, region, vpcID)
+		if err != nil {
+			fmt.Println("⚠️ IPv6 配置失败:", err)
+			enableIPv6 = false
+		} else {
+			targetSubnetID = sID
+		}
+	}
+
+	runIn := &ec2.RunInstancesInput{
+		ImageId:      aws.String(ami),
+		InstanceType: ec2t.InstanceType(itype),
+		MinCount:     aws.Int32(count),
+		MaxCount:     aws.Int32(count),
+	}
+	// 这里使用了 base64
+	if userData != "" {
+		runIn.UserData = aws.String(base64.StdEncoding.EncodeToString([]byte(userData)))
+	}
+	if enableIPv6 || sgID != "" {
+		netIf := ec2t.InstanceNetworkInterfaceSpecification{DeviceIndex: aws.Int32(0), AssociatePublicIpAddress: aws.Bool(true)}
+		if sgID != "" {
+			netIf.Groups = []string{sgID}
+		}
+		if enableIPv6 {
+			netIf.Ipv6AddressCount = aws.Int32(1)
+			netIf.SubnetId = aws.String(targetSubnetID)
+		}
+		runIn.NetworkInterfaces = []ec2t.InstanceNetworkInterfaceSpecification{netIf}
+	}
+	if volSize > 0 {
+		imgOut, _ := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{ami}})
+		if len(imgOut.Images) > 0 {
+			runIn.BlockDeviceMappings = []ec2t.BlockDeviceMapping{{
+				DeviceName: imgOut.Images[0].RootDeviceName,
+				Ebs:        &ec2t.EbsBlockDevice{VolumeSize: aws.Int32(volSize), VolumeType: ec2t.VolumeTypeGp3},
+			}}
+		}
+	}
+
+	fmt.Printf("\n🚀 正在启动 %d 台...\n", count)
+	out, err := cli.RunInstances(ctx, runIn)
+	if err != nil {
+		fmt.Println("❌ 失败:", err)
+		return
+	}
+	for _, ins := range out.Instances {
+		fmt.Println("✅ 成功:", *ins.InstanceId)
+	}
+}
 
 func lsListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]LSInstanceRow, error) {
 	var (
@@ -747,7 +985,6 @@ func lsListAll(ctx context.Context, regions []string, creds aws.CredentialsProvi
 				if ins.BundleId != nil {
 					bundle = *ins.BundleId
 				}
-
 				localRows = append(localRows, LSInstanceRow{
 					Region: region, Name: aws.ToString(ins.Name), State: state, IP: ip, IPv6: ipv6, AZ: az, Bundle: bundle,
 				})
@@ -774,7 +1011,6 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	cli := lightsail.NewFromConfig(cfg)
 	az := input("可用区 (默认自动): ", region+"a")
 	name := input("实例名称 [LS-1]: ", "LS-1")
-	fmt.Println("\n正在获取套餐...")
 	bOut, _ := cli.GetBundles(ctx, &lightsail.GetBundlesInput{})
 	type bRow struct {
 		ID    string
@@ -804,10 +1040,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	fmt.Println("--- 套餐列表 ---")
 	printTable("NO.\tID\tPrice\tRAM\tCPU", func(w *tabwriter.Writer) {
 		for i, b := range brs {
-			mk := ""
-			if i+1 == defIdx {
-				mk = " <-- 默认"
-			}
+			mk := ""; if i+1 == defIdx { mk = " <-- 默认" }
 			fmt.Fprintf(w, "[%d]\t%s\t$%.2f\t%.1f G\t%d vCPU%s\n", i+1, b.ID, b.Price, b.Ram, b.Cpu, mk)
 		}
 	})
@@ -816,7 +1049,6 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	if idx, err := strconv.Atoi(bIn); err == nil && idx > 0 && idx <= len(brs) {
 		finalBundle = brs[idx-1].ID
 	}
-	fmt.Println("\n--- 系统列表 ---")
 	pOut, _ := cli.GetBlueprints(ctx, &lightsail.GetBlueprintsInput{})
 	var osList []string
 	defOSIdx := 1
@@ -826,12 +1058,9 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		}
 	}
 	sort.Strings(osList)
+	fmt.Println("\n--- 系统列表 ---")
 	for i, os := range osList {
-		mk := ""
-		if os == "debian_12" {
-			mk = " <-- 默认"
-			defOSIdx = i + 1
-		}
+		mk := ""; if os == "debian_12" { mk = " <-- 默认"; defOSIdx = i + 1 }
 		fmt.Printf("[%d] %s%s\n", i+1, os, mk)
 	}
 	oIn := input(fmt.Sprintf("输入系统序号 (默认 %d): ", defOSIdx), "")
@@ -839,10 +1068,8 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	if idx, err := strconv.Atoi(oIn); err == nil && idx > 0 && idx <= len(osList) {
 		finalOS = osList[idx-1]
 	}
-
 	openAll := yes(input("是否全开防火墙端口 (TCP+UDP 0-65535)? [y/N]: ", "n"))
 	ud, _ := collectUserData("\n可选：UserData 脚本")
-
 	fmt.Println("🚀 创建中...")
 	_, err = cli.CreateInstances(ctx, &lightsail.CreateInstancesInput{
 		AvailabilityZone: aws.String(az), BlueprintId: aws.String(finalOS), BundleId: aws.String(finalBundle),
@@ -853,41 +1080,32 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		return
 	}
 	fmt.Println("✅ 实例创建指令已提交")
-
 	if openAll {
 		fmt.Println("⏳ 正在等待实例就绪以配置防火墙 (最多等待 60 秒)...")
-		// 轮询检查实例状态
 		ready := false
-		for i := 0; i < 30; i++ { // 30 * 2s = 60s
+		for i := 0; i < 30; i++ {
 			time.Sleep(2 * time.Second)
 			insOut, err := cli.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: aws.String(name)})
 			if err == nil && insOut.Instance != nil && insOut.Instance.State != nil {
-				state := aws.ToString(insOut.Instance.State.Name)
-				if state == "running" {
+				if aws.ToString(insOut.Instance.State.Name) == "running" {
 					ready = true
 					break
 				}
 			}
 			fmt.Print(".")
 		}
-		fmt.Println("")
-
 		if ready {
-			fmt.Println("✅ 实例已就绪，正在开启端口...")
-			_, err := cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
+			fmt.Println("\n✅ 实例已就绪，正在开启端口...")
+			cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
 				InstanceName: aws.String(name),
 				PortInfos: []lst.PortInfo{
 					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolTcp},
 					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolUdp},
 				},
 			})
-			if err != nil {
-				fmt.Printf("⚠️ 防火墙配置失败: %v\n", err)
-			} else {
-				fmt.Println("✅ 防火墙规则已更新 (全开)")
-			}
+			fmt.Println("✅ 防火墙规则已更新 (全开)")
 		} else {
-			fmt.Println("⚠️ 等待超时，实例尚未进入 Running 状态，请稍后手动配置防火墙。")
+			fmt.Println("\n⚠️ 等待超时，请稍后手动配置防火墙。")
 		}
 	}
 }
@@ -898,199 +1116,99 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 		fmt.Println("❌ 无实例")
 		return
 	}
-
 	printTable("序号\t区域\t名称\t状态\t配置\tIPv4\tIPv6", func(w *tabwriter.Writer) {
 		for _, r := range rows {
 			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", r.Idx, r.Region, r.Name, r.State, cut(r.Bundle, 10), r.IP, r.IPv6)
 		}
 	})
-
 	idx := mustInt(input("\n输入序号操作 (0 返回): ", "0"))
 	if idx <= 0 || idx > len(rows) {
 		return
 	}
 	sel := rows[idx-1]
-
 	cfg, _ := mkCfg(ctx, sel.Region, creds)
 	cli := lightsail.NewFromConfig(cfg)
-
-	// Detail View
 	fmt.Printf("\n🔍 正在获取 Lightsail 实例 %s 的详细指标...\n", sel.Name)
 	insOut, err := cli.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: &sel.Name})
-
-	var isStaticIP bool = false
+	var isStaticIP bool
 	if err == nil && insOut.Instance != nil {
 		ins := insOut.Instance
-		isStaticIP = *ins.IsStaticIp // 记录是否为静态IP
-
+		isStaticIP = *ins.IsStaticIp
 		var ports []string
 		for _, p := range ins.Networking.Ports {
-			// 优化显示：0/tcp, 0/udp 或者 protocol=all 的情况
 			if (p.FromPort == 0 && p.ToPort == 65535) || (p.FromPort == 0 && (p.Protocol == "all" || p.Protocol == "-1")) {
 				ports = append(ports, fmt.Sprintf("全部允许 (%s)", p.Protocol))
 			} else {
 				ports = append(ports, fmt.Sprintf("%d/%s", p.FromPort, p.Protocol))
 			}
 		}
-
 		fmt.Println("================================================================")
 		fmt.Printf(" 实例名称  : %s\n", *ins.Name)
 		fmt.Printf(" 所在区域  : %s (%s)\n", sel.Region, *ins.Location.AvailabilityZone)
 		fmt.Printf(" 套餐类型  : %s (%d vCPU, %.1f GB RAM)\n", *ins.BundleId, *ins.Hardware.CpuCount, *ins.Hardware.RamSizeInGb)
-		if ins.Hardware.Disks != nil && len(ins.Hardware.Disks) > 0 {
-			fmt.Printf(" 磁盘容量  : %d GB\n", *ins.Hardware.Disks[0].SizeInGb)
-		}
 		fmt.Printf(" 运行状态  : %s\n", *ins.State.Name)
 		fmt.Printf(" 公网 IPv4 : %s\n", sel.IP)
-		if isStaticIP {
-			fmt.Println(" IP 类型   : [固定IP/Static] ✅")
-		} else {
-			fmt.Println(" IP 类型   : [动态IP/Dynamic] (建议绑定固定 IP)")
-		}
-		fmt.Printf(" 私网 IPv4 : %s\n", *ins.PrivateIpAddress)
-		if sel.IPv6 != "" {
-			fmt.Printf(" IPv6 地址 : %s\n", sel.IPv6)
-		} else {
-			fmt.Printf(" IPv6 地址 : (未开启)\n")
-		}
-		if ins.SshKeyName != nil {
-			fmt.Printf(" SSH 密钥  : %s\n", *ins.SshKeyName)
-		}
+		fmt.Printf(" IP 类型   : %v\n", func() string {
+			if isStaticIP {
+				return "[固定IP/Static] ✅"
+			}
+			return "[动态IP/Dynamic]"
+		}())
 		fmt.Printf(" 开放端口  : %s\n", strings.Join(ports, ", "))
 		fmt.Println("================================================================")
 	}
-
 	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 删除 5) 管理固定 IP\n", sel.Name)
 	switch input("选择: ", "0") {
 	case "1":
-		_, err := cli.StartInstance(ctx, &lightsail.StartInstanceInput{InstanceName: &sel.Name})
-		if err == nil {
-			fmt.Println("✅ 启动中")
-		} else {
-			fmt.Println("❌ 失败:", err)
-		}
+		cli.StartInstance(ctx, &lightsail.StartInstanceInput{InstanceName: &sel.Name})
+		fmt.Println("✅ 启动中")
 	case "2":
-		_, err := cli.StopInstance(ctx, &lightsail.StopInstanceInput{InstanceName: &sel.Name})
-		if err == nil {
-			fmt.Println("✅ 停止中")
-		} else {
-			fmt.Println("❌ 失败:", err)
-		}
+		cli.StopInstance(ctx, &lightsail.StopInstanceInput{InstanceName: &sel.Name})
+		fmt.Println("✅ 停止中")
 	case "3":
-		_, err := cli.RebootInstance(ctx, &lightsail.RebootInstanceInput{InstanceName: &sel.Name})
-		if err == nil {
-			fmt.Println("✅ 重启中")
-		} else {
-			fmt.Println("❌ 失败:", err)
-		}
+		cli.RebootInstance(ctx, &lightsail.RebootInstanceInput{InstanceName: &sel.Name})
+		fmt.Println("✅ 重启中")
 	case "4":
 		if yes(input("⚠️ 确认删除实例 (删除)? [y/N]: ", "n")) {
-			// 1. Check and Release Static IP
-			fmt.Println("🔍 正在检查关联的固定 IP (Static IP)...")
+			fmt.Println("🔍 检查固定 IP...")
 			allSip, err := cli.GetStaticIps(ctx, &lightsail.GetStaticIpsInput{})
 			if err == nil {
-				foundIp := false
 				for _, s := range allSip.StaticIps {
 					if s.AttachedTo != nil && *s.AttachedTo == sel.Name {
-						foundIp = true
-						fmt.Printf("⚠️ 发现关联固定 IP (%s)，正在释放以防止扣费...\n", *s.Name)
-						_, err := cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: s.Name})
-						if err == nil {
-							fmt.Println("   ✅ IP 已释放")
-						} else {
-							fmt.Printf("   ❌ 释放失败: %v\n", err)
-						}
+						fmt.Printf("⚠️ 释放关联 IP (%s)...\n", *s.Name)
+						cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: s.Name})
 						break
 					}
 				}
-				if !foundIp {
-					fmt.Println("   无关联固定 IP。")
-				}
 			}
-
-			// 2. Delete Instance
-			_, err = cli.DeleteInstance(ctx, &lightsail.DeleteInstanceInput{InstanceName: &sel.Name})
-			if err == nil {
-				fmt.Println("🗑️ 实例删除指令已发送...")
-			} else {
-				fmt.Println("❌ 删除失败:", err)
-			}
+			cli.DeleteInstance(ctx, &lightsail.DeleteInstanceInput{InstanceName: &sel.Name})
+			fmt.Println("🗑️ 删除指令已发送")
 		}
 	case "5":
-		// 管理固定 IP 逻辑 - 修复版
 		if isStaticIP {
-			fmt.Println("ℹ️  当前实例已绑定固定 IP。")
-			if yes(input("是否【解绑 (Detach)】该固定 IP? [y/N]: ", "n")) {
-				ipName := ""
+			if yes(input("是否解绑并释放当前固定 IP? [y/N]: ", "n")) {
 				allSip, _ := cli.GetStaticIps(ctx, &lightsail.GetStaticIpsInput{})
 				for _, s := range allSip.StaticIps {
 					if s.AttachedTo != nil && *s.AttachedTo == sel.Name {
-						ipName = *s.Name
+						ipName := *s.Name
+						cli.DetachStaticIp(ctx, &lightsail.DetachStaticIpInput{StaticIpName: &ipName})
+						fmt.Println("✅ 已解绑")
+						cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: &ipName})
+						fmt.Println("🗑️ 已释放")
 						break
 					}
 				}
-				if ipName != "" {
-					_, err := cli.DetachStaticIp(ctx, &lightsail.DetachStaticIpInput{StaticIpName: &ipName})
-					if err == nil {
-						fmt.Println("✅ 已解绑。")
-						fmt.Println("⚠️  注意：闲置的固定 IP 会产生费用！")
-						if yes(input(fmt.Sprintf("是否立即【释放 (Delete)】IP %s ? [y/N]: ", ipName), "n")) {
-							_, err := cli.ReleaseStaticIp(ctx, &lightsail.ReleaseStaticIpInput{StaticIpName: &ipName})
-							if err == nil {
-								fmt.Println("🗑️ IP 已释放 (无费用风险)")
-							} else {
-								fmt.Println("❌ 释放失败:", err)
-							}
-						}
-					} else {
-						fmt.Println("❌ 解绑失败:", err)
-					}
-				} else {
-					fmt.Println("❌ 无法找到关联的 IP 名称")
-				}
 			}
 		} else {
-			fmt.Println("ℹ️  当前使用动态 IP。")
-			if yes(input("是否【创建并绑定】新的固定 IP? [y/N]: ", "n")) {
+			if yes(input("是否申请并绑定新固定 IP? [y/N]: ", "n")) {
 				newIpName := fmt.Sprintf("Static-%s", sel.Name)
-
-				// 1. 先检查该 IP 是否已存在
-				var ipExists bool = false
-				checkIp, err := cli.GetStaticIp(ctx, &lightsail.GetStaticIpInput{StaticIpName: aws.String(newIpName)})
-				if err == nil && checkIp.StaticIp != nil {
-					fmt.Printf("⚠️ 发现同名固定 IP (%s) 已存在，尝试直接绑定...\n", newIpName)
-					ipExists = true
-				} else {
-					// 2. 不存在，申请新 IP
-					fmt.Printf("正在申请新 IP (%s)...\n", newIpName)
-					_, err := cli.AllocateStaticIp(ctx, &lightsail.AllocateStaticIpInput{StaticIpName: &newIpName})
-					if err != nil {
-						fmt.Println("❌ 申请失败:", err)
-					} else {
-						fmt.Println("✅ IP 申请成功")
-						ipExists = true
-					}
-				}
-
-				// 3. 执行绑定
-				if ipExists {
-					fmt.Println("正在绑定...")
-					_, err := cli.AttachStaticIp(ctx, &lightsail.AttachStaticIpInput{
-						InstanceName: &sel.Name,
-						StaticIpName: &newIpName,
-					})
-					if err == nil {
-						fmt.Println("✅ 绑定成功！")
-					} else {
-						fmt.Println("❌ 绑定失败:", err)
-					}
-				}
+				cli.AllocateStaticIp(ctx, &lightsail.AllocateStaticIpInput{StaticIpName: &newIpName})
+				cli.AttachStaticIp(ctx, &lightsail.AttachStaticIpInput{InstanceName: &sel.Name, StaticIpName: &newIpName})
+				fmt.Println("✅ 绑定成功")
 			}
 		}
 	}
 }
-
-// -------------------- EC2 --------------------
 
 func ec2ListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]EC2InstanceRow, error) {
 	var mu sync.Mutex
@@ -1130,12 +1248,10 @@ func ec2ListAll(ctx context.Context, regions []string, creds aws.CredentialsProv
 					if ins.PrivateIpAddress != nil {
 						priv = *ins.PrivateIpAddress
 					}
-
 					ipv6 := ""
 					if len(ins.NetworkInterfaces) > 0 && len(ins.NetworkInterfaces[0].Ipv6Addresses) > 0 {
 						ipv6 = *ins.NetworkInterfaces[0].Ipv6Addresses[0].Ipv6Address
 					}
-
 					local = append(local, EC2InstanceRow{
 						Region: region, ID: *ins.InstanceId, State: string(ins.State.Name),
 						Name: name, Type: string(ins.InstanceType), PubIP: pub, PrivIP: priv, IPv6: ipv6,
@@ -1161,23 +1277,19 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 		fmt.Println("❌ 无实例")
 		return
 	}
-
 	printTable("序号\t区域\tID\t名称\t状态\t配置\t公网IP\t内网IP\tIPv6", func(w *tabwriter.Writer) {
 		for _, r := range rows {
 			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				r.Idx, r.Region, r.ID, cut(r.Name, 10), r.State, r.Type, r.PubIP, r.PrivIP, r.IPv6)
 		}
 	})
-
 	idx := mustInt(input("\n输入序号操作 (0 返回): ", "0"))
 	if idx <= 0 || idx > len(rows) {
 		return
 	}
 	sel := rows[idx-1]
-
 	cfg, _ := mkCfg(ctx, sel.Region, creds)
 	cli := ec2.NewFromConfig(cfg)
-
 	fmt.Printf("\n🔍 正在获取实例 %s 的详细指标 (磁盘/网络/密钥)...\n", sel.ID)
 	desc, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{sel.ID}})
 	if err == nil && len(desc.Reservations) > 0 {
@@ -1211,7 +1323,6 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 		fmt.Printf(" 磁盘挂载  : %s\n", strings.Join(diskInfo, ", "))
 		fmt.Println("================================================================")
 	}
-
 	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 终止\n", sel.ID)
 	switch input("选择: ", "0") {
 	case "1":
@@ -1225,424 +1336,44 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 		fmt.Println("✅ 重启中")
 	case "4":
 		if yes(input("⚠️ 确认终止实例 (删除)? [y/N]: ", "n")) {
-			// 新增：检查并释放 EIP
-			fmt.Println("🔍 正在检查关联的弹性 IP (EIP)...")
+			fmt.Println("🔍 检查关联EIP...")
 			eipOut, err := cli.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
 				Filters: []ec2t.Filter{{Name: aws.String("instance-id"), Values: []string{sel.ID}}},
 			})
 			if err == nil && len(eipOut.Addresses) > 0 {
-				fmt.Printf("⚠️ 发现 %d 个关联 EIP，正在释放以防止扣费...\n", len(eipOut.Addresses))
 				for _, addr := range eipOut.Addresses {
-					_, err := cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{AllocationId: addr.AllocationId})
-					if err == nil {
-						fmt.Printf("   ✅ 已释放 IP: %s\n", *addr.PublicIp)
-					} else {
-						fmt.Printf("   ❌ 释放失败 IP: %s (%v)\n", *addr.PublicIp, err)
-					}
+					cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{AllocationId: addr.AllocationId})
+					fmt.Printf("   ✅ 已释放 IP: %s\n", *addr.PublicIp)
 				}
-			} else {
-				fmt.Println("   无关联 EIP。")
 			}
-
 			cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
 			fmt.Println("🗑️ 正在终止...")
 		}
 	}
 }
 
-// 辅助：获取最新 AMI
-func getLatestAMI(ctx context.Context, cli *ec2.Client, owner, namePattern string) string {
-	out, err := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{
-		Owners: []string{owner},
-		Filters: []ec2t.Filter{
-			{Name: aws.String("name"), Values: []string{namePattern}},
-			{Name: aws.String("architecture"), Values: []string{"x86_64"}},
-			{Name: aws.String("virtualization-type"), Values: []string{"hvm"}},
-		},
-	})
-	if err != nil || len(out.Images) == 0 {
-		return ""
-	}
-	sort.Slice(out.Images, func(i, j int) bool { return *out.Images[i].CreationDate > *out.Images[j].CreationDate })
-	return *out.Images[0].ImageId
-}
-
-// 适配不同架构的AMI获取逻辑
-func getLatestAMIWithArch(ctx context.Context, cli *ec2.Client, owner, namePattern, arch string) string {
-	out, err := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{
-		Owners: []string{owner},
-		Filters: []ec2t.Filter{
-			{Name: aws.String("name"), Values: []string{namePattern}},
-			{Name: aws.String("architecture"), Values: []string{arch}},
-			{Name: aws.String("virtualization-type"), Values: []string{"hvm"}},
-		},
-	})
-	if err != nil || len(out.Images) == 0 {
-		return ""
-	}
-	sort.Slice(out.Images, func(i, j int) bool { return *out.Images[i].CreationDate > *out.Images[j].CreationDate })
-	return *out.Images[0].ImageId
-}
-
-func autoSetupIPv6(ctx context.Context, cli *ec2.Client, region, vpcID string) (string, error) {
-	fmt.Println("🔍 正在检查/配置 IPv6 网络环境...")
-	vpcOut, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{VpcIds: []string{vpcID}})
-	if err != nil {
-		return "", err
-	}
-	hasVpcIPv6 := false
-	var vpcCidrBlock string
-	for _, assoc := range vpcOut.Vpcs[0].Ipv6CidrBlockAssociationSet {
-		if assoc.Ipv6CidrBlockState.State == ec2t.VpcCidrBlockStateCodeAssociated {
-			hasVpcIPv6 = true
-			vpcCidrBlock = *assoc.Ipv6CidrBlock
-			break
-		}
-	}
-	if !hasVpcIPv6 {
-		fmt.Println("   -> VPC 无 IPv6，正在申请亚马逊 IPv6 CIDR...")
-		_, err := cli.AssociateVpcCidrBlock(ctx, &ec2.AssociateVpcCidrBlockInput{
-			VpcId: aws.String(vpcID), AmazonProvidedIpv6CidrBlock: aws.Bool(true),
-		})
-		if err != nil {
-			return "", fmt.Errorf("申请 VPC IPv6 失败: %v", err)
-		}
-		fmt.Print("   -> 等待分配...")
-		for i := 0; i < 10; i++ {
-			time.Sleep(3 * time.Second)
-			v, _ := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{VpcIds: []string{vpcID}})
-			for _, a := range v.Vpcs[0].Ipv6CidrBlockAssociationSet {
-				if a.Ipv6CidrBlockState.State == ec2t.VpcCidrBlockStateCodeAssociated {
-					vpcCidrBlock = *a.Ipv6CidrBlock
-					fmt.Println(" 成功:", vpcCidrBlock)
-					goto VPC_READY
-				}
-			}
-			fmt.Print(".")
-		}
-		return "", fmt.Errorf("等待 VPC IPv6 超时")
-	}
-VPC_READY:
-	subOut, err := cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
-		Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}},
-	})
-	if err != nil || len(subOut.Subnets) == 0 {
-		return "", fmt.Errorf("找不到子网")
-	}
-	targetSubnet := subOut.Subnets[0]
-	subnetID := *targetSubnet.SubnetId
-	hasSubnetIPv6 := false
-	for _, assoc := range targetSubnet.Ipv6CidrBlockAssociationSet {
-		if assoc.Ipv6CidrBlockState.State == ec2t.SubnetCidrBlockStateCodeAssociated {
-			hasSubnetIPv6 = true
-			break
-		}
-	}
-	if !hasSubnetIPv6 {
-		newSubnetCidr := strings.Replace(vpcCidrBlock, "/56", "/64", 1)
-		fmt.Printf("   -> 子网无 IPv6，正在分配 CIDR (%s)...\n", newSubnetCidr)
-		_, err := cli.AssociateSubnetCidrBlock(ctx, &ec2.AssociateSubnetCidrBlockInput{
-			SubnetId: aws.String(subnetID), Ipv6CidrBlock: aws.String(newSubnetCidr),
-		})
-		if err != nil {
-			return "", fmt.Errorf("分配子网 IPv6 失败: %v", err)
-		}
-		cli.ModifySubnetAttribute(ctx, &ec2.ModifySubnetAttributeInput{
-			SubnetId: aws.String(subnetID), AssignIpv6AddressOnCreation: &ec2t.AttributeBooleanValue{Value: aws.Bool(true)},
-		})
-	}
-	rtOut, err := cli.DescribeRouteTables(ctx, &ec2.DescribeRouteTablesInput{
-		Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}},
-	})
-	if err == nil && len(rtOut.RouteTables) > 0 {
-		rt := rtOut.RouteTables[0]
-		hasRoute := false
-		var igwID string
-		igwOut, _ := cli.DescribeInternetGateways(ctx, &ec2.DescribeInternetGatewaysInput{
-			Filters: []ec2t.Filter{{Name: aws.String("attachment.vpc-id"), Values: []string{vpcID}}},
-		})
-		if len(igwOut.InternetGateways) > 0 {
-			igwID = *igwOut.InternetGateways[0].InternetGatewayId
-		}
-		for _, r := range rt.Routes {
-			if aws.ToString(r.DestinationIpv6CidrBlock) == "::/0" {
-				hasRoute = true
-				break
-			}
-		}
-		if !hasRoute && igwID != "" {
-			fmt.Println("   -> 添加 IPv6 路由 (::/0 -> IGW)...")
-			cli.CreateRoute(ctx, &ec2.CreateRouteInput{
-				RouteTableId: rt.RouteTableId, DestinationIpv6CidrBlock: aws.String("::/0"), GatewayId: aws.String(igwID),
-			})
-		}
-	}
-	return subnetID, nil
-}
-
-func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (string, string, error) {
-	vpcs, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{Filters: []ec2t.Filter{{Name: aws.String("isDefault"), Values: []string{"true"}}}})
-	if err != nil || len(vpcs.Vpcs) == 0 {
-		return "", "", fmt.Errorf("默认 VPC 未找到")
-	}
-	vpcID := *vpcs.Vpcs[0].VpcId
-	sgName := "open-all-ports"
-	sgs, _ := cli.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
-		Filters: []ec2t.Filter{{Name: aws.String("group-name"), Values: []string{sgName}}, {Name: aws.String("vpc-id"), Values: []string{vpcID}}},
-	})
-	if len(sgs.SecurityGroups) > 0 {
-		return *sgs.SecurityGroups[0].GroupId, vpcID, nil
-	}
-	res, err := cli.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{GroupName: aws.String(sgName), Description: aws.String("Auto generated"), VpcId: aws.String(vpcID)})
-	if err != nil {
-		return "", vpcID, err
-	}
-	cli.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
-		GroupId: res.GroupId,
-		IpPermissions: []ec2t.IpPermission{
-			{IpProtocol: aws.String("-1"), IpRanges: []ec2t.IpRange{{CidrIp: aws.String("0.0.0.0/0")}}},
-			{IpProtocol: aws.String("-1"), Ipv6Ranges: []ec2t.Ipv6Range{{CidrIpv6: aws.String("::/0")}}},
-		},
-	})
-	return *res.GroupId, vpcID, nil
-}
-
-func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsProvider) {
-	// 1. 架构选择
-	fmt.Println("\n请选择 CPU 架构:")
-	fmt.Println("  1) x86_64 (Intel/AMD) [默认]")
-	fmt.Println("  2) arm64 (Graviton)")
-	archSel := input("请输入编号 [1]: ", "1")
-	targetArch := "x86_64"
-	if archSel == "2" {
-		targetArch = "arm64"
-	}
-
-	regionInfo, err := pickRegion("\n选择 EC2 Region：", regions, "us-east-1")
-	if err != nil {
-		return
-	}
-	if err := ensureRegionOptIn(ctx, regionInfo.Name, regionInfo.Status, creds); err != nil {
-		fmt.Println("❌ 区域不可用:", err)
-		return
-	}
-	region := regionInfo.Name
-	cfg, _ := mkCfg(ctx, region, creds)
-	cli := ec2.NewFromConfig(cfg)
-
-	// --- AMI 列表 (按架构自动匹配) ---
-	amiList := []AMIOption{
-		{"Debian 12", "136693071363", "debian-12-*"},
-		{"Debian 11", "136693071363", "debian-11-*"},
-		{"Ubuntu 24.04", "099720109477", "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-*"},
-		{"Ubuntu 22.04", "099720109477", "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-*"},
-		{"Ubuntu 20.04", "099720109477", "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-*"},
-		{"Amazon Linux 2023", "137112412989", "al2023-ami-2023.*"},
-		{"Amazon Linux 2", "137112412989", "amzn2-ami-hvm-*"},
-		{"CentOS Stream 9", "125523088429", "CentOS-Stream-ec2-9-*"},
-		{"Rocky Linux 9", "792107900819", "Rocky-9-EC2-Base-*"},
-		{"AlmaLinux 9", "764336703387", "AlmaLinux OS 9*"},
-		{"RHEL 9", "309956199498", "RHEL-9.*_HVM-*"},
-		{"Fedora Cloud 41", "125523088429", "Fedora-Cloud-Base-41-*"},
-		{"Arch Linux", "647457786197", "Arch-Linux-*-basic-*"},
-		{"OpenSUSE Leap 15.5", "679593333241", "openSUSE-Leap-15-5-v*-hvm-ssd-*"},
-		{"Kali Linux", "679593333241", "kali-last-snapshot-*"},
-	}
-
-	fmt.Printf("\n请选择操作系统 (%s):\n", targetArch)
-	for i, a := range amiList {
-		fmt.Printf("  %2d) %s\n", i+1, a.Name)
-	}
-	fmt.Println("  99) 自定义 AMI ID")
-
-	var ami string
-	sel := input("请输入编号 [1]: ", "1")
-
-	if sel == "99" {
-		ami = input("请输入 AMI ID: ", "")
-	} else {
-		idx := mustInt(sel)
-		if idx > 0 && idx <= len(amiList) {
-			target := amiList[idx-1]
-			fmt.Printf("🔍 正在搜索 %s (%s) 的最新镜像...\n", target.Name, targetArch)
-			ami = getLatestAMIWithArch(ctx, cli, target.Owner, target.Pattern, targetArch)
-		} else {
-			fmt.Println("❌ 编号无效")
-			return
-		}
-	}
-
-	if ami == "" {
-		fmt.Println("❌ 未找到 AMI，请检查区域或架构兼容性")
-		return
-	}
-	fmt.Println("✅ 选中 AMI:", ami)
-
-	// --- 实例类型列表 (分架构、按配置低到高排序) ---
-	var typeList []TypeOption
-	if targetArch == "x86_64" {
-		typeList = []TypeOption{
-			// T2 Family
-			{"t2.nano", "1 vCPU, 0.5 GiB"},
-			{"t2.micro", "1 vCPU, 1.0 GiB"},
-			{"t2.small", "1 vCPU, 2.0 GiB"},
-			{"t2.medium", "2 vCPU, 4.0 GiB"},
-			{"t2.large", "2 vCPU, 8.0 GiB"},
-			{"t2.xlarge", "4 vCPU, 16.0 GiB"},
-			{"t2.2xlarge", "8 vCPU, 32.0 GiB"},
-			// T3 Family
-			{"t3.nano", "2 vCPU, 0.5 GiB"},
-			{"t3.micro", "2 vCPU, 1.0 GiB"},
-			{"t3.small", "2 vCPU, 2.0 GiB"},
-			{"t3.medium", "2 vCPU, 4.0 GiB"},
-			{"t3.large", "2 vCPU, 8.0 GiB"},
-			{"t3.xlarge", "4 vCPU, 16.0 GiB"},
-			{"t3.2xlarge", "8 vCPU, 32.0 GiB"},
-			// C5/M5 (Optional high end)
-			{"c5.large", "2 vCPU, 4.0 GiB"},
-			{"m5.large", "2 vCPU, 8.0 GiB"},
-		}
-	} else {
-		// ARM (T4g Family)
-		typeList = []TypeOption{
-			{"t4g.nano", "2 vCPU, 0.5 GiB"},
-			{"t4g.micro", "2 vCPU, 1.0 GiB"},
-			{"t4g.small", "2 vCPU, 2.0 GiB"},
-			{"t4g.medium", "2 vCPU, 4.0 GiB"},
-			{"t4g.large", "2 vCPU, 8.0 GiB"},
-			{"t4g.xlarge", "4 vCPU, 16.0 GiB"},
-			{"t4g.2xlarge", "8 vCPU, 32.0 GiB"},
-			{"c6g.large", "2 vCPU, 4.0 GiB"},
-			{"m6g.large", "2 vCPU, 8.0 GiB"},
-		}
-	}
-
-	fmt.Printf("\n请选择实例类型 (%s):\n", targetArch)
-	for i, t := range typeList {
-		fmt.Printf("  %2d) %-12s - %s\n", i+1, t.Type, t.Desc)
-	}
-	fmt.Println("  99) 自定义类型 (如 c6i.metal)")
-
-	var itype string
-	tSel := input("请输入编号 [1]: ", "1") // 默认选1 (t2.nano or t4g.nano)
-	if tSel == "99" {
-		itype = input("请输入类型: ", "t3.micro")
-	} else {
-		idx := mustInt(tSel)
-		if idx > 0 && idx <= len(typeList) {
-			itype = typeList[idx-1].Type
-		} else {
-			itype = typeList[0].Type // 默认第一个
-		}
-	}
-	fmt.Println("✅ 选中类型:", itype)
-
-	count := int32(mustInt(input("启动数量 [1]: ", "1")))
-	if count < 1 {
-		count = 1
-	}
-	var volSize int32
-	if d := input("磁盘大小(GB) [默认]: ", ""); d != "" {
-		volSize = int32(mustInt(d))
-	}
-	enableIPv6 := yes(input("自动分配 IPv6? [y/N]: ", "n"))
-	rootPwd := input("设置 SSH root 密码 (留空跳过): ", "")
-	openAll := yes(input("全开端口 (安全组)? [y/N]: ", "n"))
-
-	rawUD, empty := collectUserData("\n可选：EC2 启动脚本")
-	userData := ""
-	if rootPwd != "" {
-		userData = fmt.Sprintf(`#!/bin/bash
-echo "root:%s" | chpasswd
-sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-service sshd restart
-service ssh restart
-`, rootPwd)
-		if !empty {
-			userData += "\n" + rawUD
-		}
-	} else if !empty {
-		userData = rawUD
-	}
-
-	var sgID, vpcID string
-	if openAll || enableIPv6 {
-		s, v, err := ensureOpenAllSG(ctx, cli, region)
-		if err != nil {
-			fmt.Println("❌ 网络错误:", err)
-			return
-		}
-		sgID = s
-		vpcID = v
-		if openAll {
-			fmt.Println("✅ 安全组:", sgID)
-		}
-	}
-
-	var targetSubnetID string
-	if enableIPv6 {
-		sID, err := autoSetupIPv6(ctx, cli, region, vpcID)
-		if err != nil {
-			fmt.Println("⚠️ IPv6 配置失败:", err)
-			enableIPv6 = false
-		} else {
-			targetSubnetID = sID
-			fmt.Println("✅ IPv6 环境就绪:", targetSubnetID)
-		}
-	}
-
-	runIn := &ec2.RunInstancesInput{
-		ImageId: aws.String(ami), InstanceType: ec2t.InstanceType(itype),
-		MinCount: aws.Int32(count), MaxCount: aws.Int32(count),
-	}
-	if userData != "" {
-		runIn.UserData = aws.String(base64.StdEncoding.EncodeToString([]byte(userData)))
-	}
-
-	if enableIPv6 || sgID != "" {
-		netIf := ec2t.InstanceNetworkInterfaceSpecification{DeviceIndex: aws.Int32(0), AssociatePublicIpAddress: aws.Bool(true)}
-		if sgID != "" {
-			netIf.Groups = []string{sgID}
-		}
-		if enableIPv6 {
-			netIf.Ipv6AddressCount = aws.Int32(1)
-			netIf.SubnetId = aws.String(targetSubnetID)
-		}
-		runIn.NetworkInterfaces = []ec2t.InstanceNetworkInterfaceSpecification{netIf}
-	}
-
-	if volSize > 0 {
-		imgOut, _ := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{ami}})
-		if len(imgOut.Images) > 0 {
-			runIn.BlockDeviceMappings = []ec2t.BlockDeviceMapping{{
-				DeviceName: imgOut.Images[0].RootDeviceName,
-				Ebs:        &ec2t.EbsBlockDevice{VolumeSize: aws.Int32(volSize), VolumeType: ec2t.VolumeTypeGp3},
-			}}
-			fmt.Printf("✅ 磁盘: %dGB\n", volSize)
-		}
-	}
-
-	fmt.Printf("\n🚀 正在启动 %d 台...\n", count)
-	out, err := cli.RunInstances(ctx, runIn)
-	if err != nil {
-		fmt.Println("❌ 失败:", err)
-		return
-	}
-	for _, ins := range out.Instances {
-		fmt.Println("✅ 成功:", *ins.InstanceId)
-	}
-}
-
 // -------------------- Main --------------------
 
 func main() {
-	rand.Seed(time.Now().UnixNano()) // 初始化随机种子
-
+	rand.Seed(time.Now().UnixNano())
 	ctx := context.Background()
-	fmt.Println("=== AWS 管理工具 (Win/Linux) ===")
+	fmt.Println("=== AWS 管理工具 (Win) ===")
+
+	// 代理选择菜单
+	fmt.Println("\n请选择连接方式:")
+	fmt.Println(" 1) 直连 (Direct Connection) [默认]")
+	fmt.Println(" 2) 代理 (Use Proxy)")
+	connType := input("选择 [1]: ", "1")
+
+	if connType == "2" {
+		rawProxy := input("请输入代理地址 (host:port:user:pass 或 socks5://...): ", "")
+		GlobalProxy = parseProxyString(rawProxy)
+		if GlobalProxy != "" {
+			fmt.Println("🔄 使用代理:", GlobalProxy)
+		}
+	} else {
+		fmt.Println("🌐 使用直连模式")
+	}
 
 	ak := input("AWS Access Key ID: ", "")
 	sk := inputSecret("AWS Secret Access Key: ")
