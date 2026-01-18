@@ -82,7 +82,7 @@ func regionCN(region string) string {
 	m := map[string]string{
 		"af-south-1":     "南非·开普敦",
 		"ap-east-1":      "中国·香港",
-		"ap-east-2":      "亚太·其他",
+		"ap-east-2":      "中国·台湾",
 		"ap-northeast-1": "日本·东京",
 		"ap-northeast-2": "韩国·首尔",
 		"ap-northeast-3": "日本·大阪",
