@@ -38,10 +38,10 @@ import (
 )
 
 /*
-AWS Manager (Go) - 代理选择版
-- 启动时明确选择：1.直连 / 2.代理
-- 包含 $80 任务自动化
-- 包含完整 EC2/Lightsail 管理
+AWS Manager (Go) - 格式修复版 ($80)
+- 修复 U+00A0 不换行空格错误
+- 包含 $80 任务 (Budget, EC2-Micro, Lambda, RDS)
+- 移除 Bedrock
 */
 
 const bootstrapRegion = "us-east-1"
@@ -329,7 +329,7 @@ func taskRunEC2(ctx context.Context, cfg aws.Config) {
 	ami := "ami-051f7e7f6c2f40dc1"
 	runOut, err := cli.RunInstances(ctx, &ec2.RunInstancesInput{
 		ImageId:      aws.String(ami),
-		InstanceType: ec2t.InstanceTypeT3Nano,
+		InstanceType: ec2t.InstanceTypeT3Micro, // 修正为 t3.micro
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
 	})
