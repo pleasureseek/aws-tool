@@ -38,10 +38,9 @@ import (
 )
 
 /*
-AWS Manager (Go) - 格式修复版 ($80)
-- 修复 U+00A0 不换行空格错误
-- 包含 $80 任务 (Budget, EC2-Micro, Lambda, RDS)
-- 移除 Bedrock
+AWS Manager (Go) - 全能网络版 (自动修复)
+- IPv6: 遇错直接修复，不询问
+- IPv4: 支持弹性 IP 管理
 */
 
 const bootstrapRegion = "us-east-1"
@@ -647,8 +646,8 @@ func checkQuotas(ctx context.Context, creds aws.CredentialsProvider) {
 	input("\n按回车返回...", "")
 }
 
-func autoSetupIPv6(ctx context.Context, cli *ec2.Client, region, vpcID string) (string, error) {
-	fmt.Println("🔍 配置 IPv6...")
+func autoSetupIPv6(ctx context.Context, cli *ec2.Client, region, vpcID, targetSubnetID string) (string, error) {
+	fmt.Println("🔍 配置 IPv6 (VPC/子网)...")
 	vpcOut, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{VpcIds: []string{vpcID}})
 	if err != nil {
 		return "", err
@@ -683,36 +682,90 @@ func autoSetupIPv6(ctx context.Context, cli *ec2.Client, region, vpcID string) (
 		return "", fmt.Errorf("超时")
 	}
 VPC_READY:
-	subOut, err := cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
+	// 获取子网
+	var subOut *ec2.DescribeSubnetsOutput
+	if targetSubnetID != "" {
+		subOut, err = cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{SubnetIds: []string{targetSubnetID}})
+	} else {
+		subOut, err = cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
+	}
+
 	if err != nil || len(subOut.Subnets) == 0 {
 		return "", fmt.Errorf("无子网")
 	}
-	subnetID := *subOut.Subnets[0].SubnetId
-	newSubnetCidr := strings.Replace(vpcCidrBlock, "/56", "/64", 1)
-	cli.AssociateSubnetCidrBlock(ctx, &ec2.AssociateSubnetCidrBlockInput{SubnetId: aws.String(subnetID), Ipv6CidrBlock: aws.String(newSubnetCidr)})
+
+	subnet := subOut.Subnets[0]
+	subnetID := *subnet.SubnetId
+	
+	// 检查子网是否已有 IPv6
+	hasSubnetIPv6 := false
+	for _, assoc := range subnet.Ipv6CidrBlockAssociationSet {
+		if assoc.Ipv6CidrBlockState.State == ec2t.SubnetCidrBlockStateCodeAssociated {
+			hasSubnetIPv6 = true
+			break
+		}
+	}
+
+	if !hasSubnetIPv6 {
+		newSubnetCidr := strings.Replace(vpcCidrBlock, "/56", "/64", 1)
+		_, err = cli.AssociateSubnetCidrBlock(ctx, &ec2.AssociateSubnetCidrBlockInput{SubnetId: aws.String(subnetID), Ipv6CidrBlock: aws.String(newSubnetCidr)})
+		if err != nil {
+			if strings.Contains(err.Error(), "Conflict") {
+				return "", fmt.Errorf("IPv6网段分配冲突，请手动在控制台配置子网 CIDR")
+			}
+			return "", err
+		}
+		fmt.Println("   -> 子网关联 IPv6 CIDR 成功")
+	}
+
 	cli.ModifySubnetAttribute(ctx, &ec2.ModifySubnetAttributeInput{
 		SubnetId: aws.String(subnetID), AssignIpv6AddressOnCreation: &ec2t.AttributeBooleanValue{Value: aws.Bool(true)},
 	})
+
 	// Route
 	rtOut, err := cli.DescribeRouteTables(ctx, &ec2.DescribeRouteTablesInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
 	if err == nil && len(rtOut.RouteTables) > 0 {
-		rt := rtOut.RouteTables[0]
-		hasRoute := false
-		var igwID string
-		igwOut, _ := cli.DescribeInternetGateways(ctx, &ec2.DescribeInternetGatewaysInput{Filters: []ec2t.Filter{{Name: aws.String("attachment.vpc-id"), Values: []string{vpcID}}}})
-		if len(igwOut.InternetGateways) > 0 {
-			igwID = *igwOut.InternetGateways[0].InternetGatewayId
-		}
-		for _, r := range rt.Routes {
-			if aws.ToString(r.DestinationIpv6CidrBlock) == "::/0" {
-				hasRoute = true
-				break
+		// 找到关联该子网的路由表，或者主路由表
+		var targetRT *ec2t.RouteTable
+		for _, rt := range rtOut.RouteTables {
+			for _, assoc := range rt.Associations {
+				if assoc.SubnetId != nil && *assoc.SubnetId == subnetID {
+					targetRT = &rt
+					goto FOUND_RT
+				}
 			}
 		}
-		if !hasRoute && igwID != "" {
-			cli.CreateRoute(ctx, &ec2.CreateRouteInput{
-				RouteTableId: rt.RouteTableId, DestinationIpv6CidrBlock: aws.String("::/0"), GatewayId: aws.String(igwID),
-			})
+		if targetRT == nil {
+			for _, rt := range rtOut.RouteTables {
+				for _, assoc := range rt.Associations {
+					if assoc.Main != nil && *assoc.Main {
+						targetRT = &rt
+						goto FOUND_RT
+					}
+				}
+			}
+		}
+
+	FOUND_RT:
+		if targetRT != nil {
+			hasRoute := false
+			var igwID string
+			igwOut, _ := cli.DescribeInternetGateways(ctx, &ec2.DescribeInternetGatewaysInput{Filters: []ec2t.Filter{{Name: aws.String("attachment.vpc-id"), Values: []string{vpcID}}}})
+			if len(igwOut.InternetGateways) > 0 {
+				igwID = *igwOut.InternetGateways[0].InternetGatewayId
+			}
+			for _, r := range targetRT.Routes {
+				if aws.ToString(r.DestinationIpv6CidrBlock) == "::/0" {
+					hasRoute = true
+					break
+				}
+			}
+			if !hasRoute && igwID != "" {
+				cli.CreateRoute(ctx, &ec2.CreateRouteInput{
+					RouteTableId: targetRT.RouteTableId, DestinationIpv6CidrBlock: aws.String("::/0"), GatewayId: aws.String(igwID),
+				})
+				fmt.Println("   -> 路由表更新成功 (::/0 -> IGW)")
+			}
 		}
 	}
 	return subnetID, nil
@@ -892,7 +945,7 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 
 	var targetSubnetID string
 	if enableIPv6 {
-		sID, err := autoSetupIPv6(ctx, cli, region, vpcID)
+		sID, err := autoSetupIPv6(ctx, cli, region, vpcID, "")
 		if err != nil {
 			fmt.Println("⚠️ IPv6 配置失败:", err)
 			enableIPv6 = false
@@ -1292,8 +1345,17 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 	cli := ec2.NewFromConfig(cfg)
 	fmt.Printf("\n🔍 正在获取实例 %s 的详细指标 (磁盘/网络/密钥)...\n", sel.ID)
 	desc, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{sel.ID}})
+	
+	// 用于保存主网卡ID和当前IPv6列表，供后续操作使用
+	var eniID string
+	var currentIPv6s []string
+	var vpcID, subnetID string
+
 	if err == nil && len(desc.Reservations) > 0 {
 		ins := desc.Reservations[0].Instances[0]
+		vpcID = *ins.VpcId
+		subnetID = *ins.SubnetId
+
 		var diskInfo []string
 		for _, bd := range ins.BlockDeviceMappings {
 			if bd.Ebs != nil {
@@ -1304,6 +1366,15 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 				}
 			}
 		}
+
+		// 获取主网卡信息
+		if len(ins.NetworkInterfaces) > 0 {
+			eniID = *ins.NetworkInterfaces[0].NetworkInterfaceId
+			for _, addr := range ins.NetworkInterfaces[0].Ipv6Addresses {
+				currentIPv6s = append(currentIPv6s, *addr.Ipv6Address)
+			}
+		}
+
 		fmt.Println("================================================================")
 		fmt.Printf(" 实例 ID   : %s\n", *ins.InstanceId)
 		fmt.Printf(" 所在区域  : %s (%s)\n", sel.Region, *ins.Placement.AvailabilityZone)
@@ -1311,8 +1382,8 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 		fmt.Printf(" 运行状态  : %s\n", ins.State.Name)
 		fmt.Printf(" 公网 IPv4 : %s\n", sel.PubIP)
 		fmt.Printf(" 内网 IPv4 : %s\n", sel.PrivIP)
-		if sel.IPv6 != "" {
-			fmt.Printf(" IPv6 地址 : %s\n", sel.IPv6)
+		if len(currentIPv6s) > 0 {
+			fmt.Printf(" IPv6 地址 : %s\n", strings.Join(currentIPv6s, ", "))
 		} else {
 			fmt.Printf(" IPv6 地址 : (未分配)\n")
 		}
@@ -1323,7 +1394,8 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 		fmt.Printf(" 磁盘挂载  : %s\n", strings.Join(diskInfo, ", "))
 		fmt.Println("================================================================")
 	}
-	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 终止\n", sel.ID)
+
+	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 终止 5) 🔧 网络管理 (IP)\n", sel.ID)
 	switch input("选择: ", "0") {
 	case "1":
 		cli.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{sel.ID}})
@@ -1348,6 +1420,166 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 			}
 			cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
 			fmt.Println("🗑️ 正在终止...")
+		}
+	case "5":
+		if eniID == "" {
+			fmt.Println("❌ 无法找到网络接口 (ENI)，无法操作")
+			return
+		}
+		fmt.Println("\n--- 网络/IP 管理 ---")
+		fmt.Println(" 1) IPv6 管理 (分配/删除)")
+		fmt.Println(" 2) IPv4 公网/弹性IP 管理 (绑定/释放)")
+		netSel := input("选择: ", "0")
+
+		if netSel == "1" {
+			// ============ IPv6 Logic ============
+			fmt.Printf("当前 IPv6: %v\n", currentIPv6s)
+			fmt.Println(" 1) ➕ 分配新 IPv6")
+			fmt.Println(" 2) ➖ 删除现有 IPv6")
+			sub := input("选择: ", "0")
+			if sub == "1" {
+				_, err := cli.AssignIpv6Addresses(ctx, &ec2.AssignIpv6AddressesInput{
+					NetworkInterfaceId: aws.String(eniID),
+					Ipv6AddressCount:   aws.Int32(1),
+				})
+				if err != nil {
+					// 自动修复逻辑：检查是否是网段缺失
+					if strings.Contains(err.Error(), "Subnet does not contain any IPv6 CIDR block ranges") {
+						fmt.Println("\n⚠️  检测到子网未配置 IPv6，正在自动修复 (VPC/子网/路由)...")
+						_, errFix := autoSetupIPv6(ctx, cli, sel.Region, vpcID, subnetID)
+						if errFix != nil {
+							fmt.Printf("❌ 修复失败: %v\n", errFix)
+						} else {
+							fmt.Println("✅ 网络配置已修复，正在重试分配 IP...")
+							time.Sleep(2 * time.Second)
+							_, errRetry := cli.AssignIpv6Addresses(ctx, &ec2.AssignIpv6AddressesInput{
+								NetworkInterfaceId: aws.String(eniID),
+								Ipv6AddressCount:   aws.Int32(1),
+							})
+							if errRetry != nil {
+								fmt.Printf("❌ 重试分配失败: %v\n", errRetry)
+							} else {
+								fmt.Println("✅ 分配成功！(IP 可能需要几秒钟才会显示)")
+							}
+						}
+					} else {
+						fmt.Printf("❌ 分配失败: %v\n", err)
+					}
+				} else {
+					fmt.Println("✅ 分配成功！(IP 可能需要几秒钟才会显示)")
+				}
+			} else if sub == "2" {
+				if len(currentIPv6s) == 0 {
+					fmt.Println("❌ 当前没有 IPv6 地址可删除")
+					return
+				}
+				fmt.Println("请选择要删除的 IP:")
+				for i, ip := range currentIPv6s {
+					fmt.Printf(" %d) %s\n", i+1, ip)
+				}
+				delIdx := mustInt(input("编号: ", "0"))
+				if delIdx > 0 && delIdx <= len(currentIPv6s) {
+					targetIP := currentIPv6s[delIdx-1]
+					_, err := cli.UnassignIpv6Addresses(ctx, &ec2.UnassignIpv6AddressesInput{
+						NetworkInterfaceId: aws.String(eniID),
+						Ipv6Addresses:      []string{targetIP},
+					})
+					if err != nil {
+						fmt.Printf("❌ 删除失败: %v\n", err)
+					} else {
+						fmt.Printf("✅ 已删除: %s\n", targetIP)
+					}
+				}
+			}
+		} else if netSel == "2" {
+			// ============ IPv4 EIP Logic ============
+			fmt.Println("\n--- 弹性公网 IP (Elastic IP) ---")
+			eipOut, err := cli.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
+				Filters: []ec2t.Filter{{Name: aws.String("instance-id"), Values: []string{sel.ID}}},
+			})
+			if err != nil {
+				fmt.Println("❌ 查询失败:", err)
+				return
+			}
+			
+			hasEIP := len(eipOut.Addresses) > 0
+			fmt.Printf("当前公网 IP: %s\n", sel.PubIP)
+			if hasEIP {
+				fmt.Println("状态: [✅ 已绑定弹性 IP]")
+				for _, addr := range eipOut.Addresses {
+					fmt.Printf(" - %s (AllocationId: %s)\n", *addr.PublicIp, *addr.AllocationId)
+				}
+			} else {
+				fmt.Println("状态: [⚠️ 动态公网 IP (重启可能会变)]")
+			}
+
+			fmt.Println("\n 1) ➕ 申请并绑定新 EIP (收费/Static)")
+			fmt.Println(" 2) ➖ 解绑并释放 EIP (省费)")
+			
+			sub := input("选择: ", "0")
+			if sub == "1" {
+				if hasEIP {
+					fmt.Println("⚠️ 提示: 该实例已经绑定了弹性 IP。绑定多个可能需要配置辅助网卡。")
+					if !yes(input("继续申请吗? [y/N]: ", "n")) {
+						return
+					}
+				}
+				// 1. Allocate
+				fmt.Print("⏳ 正在申请 IP...")
+				allocOut, err := cli.AllocateAddress(ctx, &ec2.AllocateAddressInput{Domain: ec2t.DomainTypeVpc})
+				if err != nil {
+					fmt.Println("\n❌ 申请失败:", err)
+					return
+				}
+				newIP := *allocOut.PublicIp
+				allocID := *allocOut.AllocationId
+				fmt.Printf("成功! 获取到: %s\n", newIP)
+
+				// 2. Associate
+				fmt.Print("⏳ 正在绑定...")
+				_, err = cli.AssociateAddress(ctx, &ec2.AssociateAddressInput{
+					InstanceId: aws.String(sel.ID),
+					AllocationId: aws.String(allocID),
+				})
+				if err != nil {
+					fmt.Printf("\n❌ 绑定失败: %v\n", err)
+					fmt.Println("   正在回滚 (释放 IP)...")
+					cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{AllocationId: aws.String(allocID)})
+				} else {
+					fmt.Println("\n✅ 绑定成功！现在该实例拥有固定 IP。")
+				}
+
+			} else if sub == "2" {
+				if !hasEIP {
+					fmt.Println("❌ 当前没有绑定弹性 IP，无法释放。")
+					return
+				}
+				// 默认只处理第一个，如果需要更复杂可以做列表选择
+				target := eipOut.Addresses[0]
+				fmt.Printf("即将释放 IP: %s\n", *target.PublicIp)
+				if yes(input("确认解绑并释放? [y/N]: ", "n")) {
+					// 1. Disassociate
+					if target.AssociationId != nil {
+						_, err := cli.DisassociateAddress(ctx, &ec2.DisassociateAddressInput{
+							AssociationId: target.AssociationId,
+						})
+						if err != nil {
+							fmt.Println("❌ 解绑失败:", err)
+							return
+						}
+						fmt.Println("✅ 已解绑")
+					}
+					// 2. Release
+					_, err := cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
+						AllocationId: target.AllocationId,
+					})
+					if err != nil {
+						fmt.Println("❌ 释放失败 (IP可能仍被保留):", err)
+					} else {
+						fmt.Println("✅ 已释放 (停止计费)")
+					}
+				}
+			}
 		}
 	}
 }
