@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2t "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/kendraranking"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	lambdaTypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
@@ -38,9 +39,9 @@ import (
 )
 
 /*
-AWS Manager (Go) - 编译修复版
-1. [修复] lsControl 函数中 client 类型初始化错误 (ec2 -> lightsail)
-2. [功能] 包含 AI CPU 列表、台北区域修复、16 vCPU 支持
+AWS Manager (Go) - Kiro 子菜单调整版
+- 主菜单保持原样 (Kiro 在第 7 项)
+- Kiro 子菜单中：检测资格排在第 1 位
 */
 
 const bootstrapRegion = "us-east-1"
@@ -73,6 +74,14 @@ type EC2InstanceRow struct {
 	IPv6   string
 }
 
+type KiroPlanRow struct {
+	Idx    int
+	Name   string
+	ID     string
+	Status string
+	Region string
+}
+
 type RegionInfo struct {
 	Name   string
 	Status string
@@ -84,15 +93,9 @@ type AMIOption struct {
 	Pattern string
 }
 
-// 详细实例配置结构
-type DetailedTypeOption struct {
-	Type     string
-	VCpu     int
-	RamVal   float64 // GB
-	RamStr   string
-	Price    string
-	Desc     string
-	AiReason string // 不推荐用于AI的理由
+type TypeOption struct {
+	Type string
+	Desc string
 }
 
 // -------------------- UI/辅助函数 --------------------
@@ -118,8 +121,7 @@ func parseProxyString(raw string) string {
 
 func regionCN(region string) string {
 	m := map[string]string{
-		"af-south-1": "南非·开普敦", "ap-east-1": "中国·香港",
-		"ap-east-2": "中国·台湾", // ✅ 台北区域
+		"af-south-1": "南非·开普敦", "ap-east-1": "中国·香港", "ap-east-2": "中国·台湾",
 		"ap-northeast-1": "日本·东京", "ap-northeast-2": "韩国·首尔", "ap-northeast-3": "日本·大阪",
 		"ap-south-1": "印度·孟买", "ap-south-2": "印度·海得拉巴", "ap-southeast-1": "新加坡",
 		"ap-southeast-2": "澳大利亚·悉尼", "ap-southeast-3": "印度尼西亚·雅加达", "ap-southeast-4": "澳大利亚·墨尔本",
@@ -251,8 +253,6 @@ func pickRegion(title string, items []RegionInfo, def string) (RegionInfo, error
 			statusMark = " [⚠️ 未启用]"
 		} else if it.Status == "opted-in" {
 			statusMark = " [已启用]"
-		} else if it.Status == "enabling" {
-			statusMark = " [⏳ 启用中]"
 		}
 		fmt.Printf("  %2d) %-14s --- %s%s\n", i+1, it.Name, regionCN(it.Name), statusMark)
 	}
@@ -294,7 +294,137 @@ func printTable(header string, rowsFunc func(*tabwriter.Writer)) {
 	w.Flush()
 }
 
-// -------------------- 2. 自动化 $80 任务逻辑 --------------------
+// -------------------- Kiro (Kendra Ranking) 逻辑 --------------------
+
+func kiroManage(ctx context.Context, regions []RegionInfo, creds aws.CredentialsProvider) {
+	fmt.Println("\n====== 🧠 Kiro (Kendra Intelligent Ranking) 管理 ======")
+	// 子菜单调整：检测资格排第一
+	fmt.Println("1) 🔎 检测开通资格 (Probe)")
+	fmt.Println("2) 查看所有区域 Kiro 实例 (Rescore Plans)")
+	fmt.Println("3) 创建新 Kiro 实例")
+	fmt.Println("0) 返回")
+
+	sel := input("请选择: ", "0")
+	switch sel {
+	case "1":
+		kiroCheck(ctx, regions, creds)
+	case "2":
+		kiroListAll(ctx, regions, creds)
+	case "3":
+		kiroCreate(ctx, regions, creds)
+	}
+}
+
+// 资格检测 (Probe)
+func kiroCheck(ctx context.Context, regions []RegionInfo, creds aws.CredentialsProvider) {
+	regionInfo, err := pickRegion("\n选择要检测的区域：", regions, "us-east-1")
+	if err != nil {
+		return
+	}
+	fmt.Printf("🔍 正在探测 %s 区域的 API 权限 (403 检测)...\n", regionInfo.Name)
+
+	cfg, _ := mkCfg(ctx, regionInfo.Name, creds)
+	cli := kendraranking.NewFromConfig(cfg)
+
+	// 尝试列出资源，如果返回 403 AccessDenied，则说明无资格
+	_, err = cli.ListRescoreExecutionPlans(ctx, &kendraranking.ListRescoreExecutionPlansInput{})
+	
+	if err == nil {
+		fmt.Println("\n✅ [资格有效] 探测成功。")
+		fmt.Println("   API 返回 200 OK，未出现 403 错误。您可以尝试创建实例。")
+	} else {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "AccessDenied") || strings.Contains(errMsg, "403") {
+			fmt.Println("\n❌ [无资格] 检测到 403 Access Denied。")
+			fmt.Println("   原因：账号权限不足或被风控，无法使用 Kiro 服务。")
+		} else if strings.Contains(errMsg, "UnknownService") || strings.Contains(errMsg, "not supported") {
+			fmt.Println("\n❌ [不支持] 该区域不支持 Kendra Ranking 服务。")
+		} else {
+			fmt.Printf("\n⚠️ [其他错误] %v\n", err)
+		}
+	}
+	input("\n按回车返回...", "")
+}
+
+func kiroListAll(ctx context.Context, regions []RegionInfo, creds aws.CredentialsProvider) {
+	var mu sync.Mutex
+	var rows []KiroPlanRow
+	var wg sync.WaitGroup
+
+	fmt.Printf("正在并发扫描 %d 个区域的 Kiro 实例...\n", len(regions))
+
+	for _, rg := range regions {
+		wg.Add(1)
+		go func(r RegionInfo) {
+			defer wg.Done()
+			cfg, err := mkCfg(ctx, r.Name, creds)
+			if err != nil {
+				return
+			}
+			cli := kendraranking.NewFromConfig(cfg)
+			out, err := cli.ListRescoreExecutionPlans(ctx, &kendraranking.ListRescoreExecutionPlansInput{})
+			if err != nil {
+				return // 忽略不支持该服务的区域
+			}
+
+			var local []KiroPlanRow
+			for _, item := range out.SummaryItems {
+				local = append(local, KiroPlanRow{
+					Name:   aws.ToString(item.Name),
+					ID:     aws.ToString(item.Id),
+					Status: string(item.Status),
+					Region: r.Name,
+				})
+			}
+
+			mu.Lock()
+			rows = append(rows, local...)
+			mu.Unlock()
+		}(rg)
+	}
+	wg.Wait()
+
+	if len(rows) == 0 {
+		fmt.Println("❌ 未发现任何 Kiro 实例。")
+		return
+	}
+
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Region < rows[j].Region })
+
+	printTable("序号\t区域\t名称\t状态\tID", func(w *tabwriter.Writer) {
+		for i, r := range rows {
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", i+1, r.Region, r.Name, r.Status, r.ID)
+		}
+	})
+	input("\n按回车返回...", "")
+}
+
+func kiroCreate(ctx context.Context, regions []RegionInfo, creds aws.CredentialsProvider) {
+	regionInfo, err := pickRegion("\n选择要建立 Kiro 的区域：", regions, "us-east-1")
+	if err != nil {
+		return
+	}
+
+	name := input("请输入 Kiro 实例名称 [MyKiroPlan]: ", "MyKiroPlan")
+	fmt.Printf("🚀 正在区域 %s 创建 Kiro 实例...\n", regionInfo.Name)
+
+	cfg, _ := mkCfg(ctx, regionInfo.Name, creds)
+	cli := kendraranking.NewFromConfig(cfg)
+
+	out, err := cli.CreateRescoreExecutionPlan(ctx, &kendraranking.CreateRescoreExecutionPlanInput{
+		Name: aws.String(name),
+	})
+
+	if err != nil {
+		fmt.Printf("❌ 创建失败: %v\n", err)
+	} else {
+		fmt.Printf("✅ 创建指令已提交！Plan ID: %s\n", *out.Id)
+		fmt.Println("注意：Kiro 实例可能产生按小时计费的成本。")
+	}
+	input("\n按回车返回...", "")
+}
+
+// -------------------- 自动化 $80 任务逻辑 --------------------
 
 func taskSetBudget(ctx context.Context, cfg aws.Config, acctID string) {
 	fmt.Println("\n[任务 1/4] 正在设置 AWS Cost Budget (成本预算)...")
@@ -337,7 +467,7 @@ func taskRunEC2(ctx context.Context, cfg aws.Config) {
 	ami := "ami-051f7e7f6c2f40dc1"
 	runOut, err := cli.RunInstances(ctx, &ec2.RunInstancesInput{
 		ImageId:      aws.String(ami),
-		InstanceType: ec2t.InstanceTypeT3Micro,
+		InstanceType: ec2t.InstanceTypeT3Micro, // 修正为 t3.micro
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
 	})
@@ -441,12 +571,12 @@ func taskRunRDS(ctx context.Context, cfg aws.Config) {
 	masterUser := "admin"
 	masterPass := "Password123456"
 	_, err := rdsCli.CreateDBInstance(ctx, &rds.CreateDBInstanceInput{
-		DBInstanceIdentifier:  aws.String(dbName),
-		DBInstanceClass:       aws.String("db.t3.micro"),
-		Engine:                aws.String("mysql"),
-		MasterUsername:        aws.String(masterUser),
-		MasterUserPassword:    aws.String(masterPass),
-		AllocatedStorage:      aws.Int32(20),
+		DBInstanceIdentifier: aws.String(dbName),
+		DBInstanceClass:      aws.String("db.t3.micro"),
+		Engine:               aws.String("mysql"),
+		MasterUsername:       aws.String(masterUser),
+		MasterUserPassword:   aws.String(masterPass),
+		AllocatedStorage:     aws.Int32(20),
 		BackupRetentionPeriod: aws.Int32(0),
 	})
 	if err != nil {
@@ -549,7 +679,7 @@ func autoClaimCredits(ctx context.Context, creds aws.CredentialsProvider) {
 	}
 }
 
-// -------------------- 3. AWS 功能函数 (EC2, Lightsail) --------------------
+// -------------------- AWS 功能函数 (EC2, Lightsail) --------------------
 
 func getEC2RegionsWithStatus(ctx context.Context, creds aws.CredentialsProvider) ([]RegionInfo, error) {
 	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
@@ -592,89 +722,48 @@ func getLightsailRegions(ctx context.Context, creds aws.CredentialsProvider) ([]
 	return rs, nil
 }
 
-// 修正后的启用逻辑：忽略 "status" 异常，强行尝试继续
 func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, creds aws.CredentialsProvider) error {
-	// 1. 如果状态已经是“已启用”或“无需启用”，直接返回
 	if currentStatus == "opt-in-not-required" || currentStatus == "opted-in" {
 		return nil
 	}
-
-	fmt.Printf("\n⚠️  检测到区域 %s 当前状态为: %s\n", regionName, currentStatus)
-	// 如果状态是 "enabling" (正在启用中)，直接进入等待逻辑，不发请求
-	if currentStatus == "enabling" {
-		fmt.Println("⏳ 区域正在启用中，直接进入等待检查...")
-		goto WAIT_LOOP
-	}
-
-	if !yes(input("是否尝试调用 API 启用？[y/N]: ", "n")) {
+	fmt.Printf("\n⚠️  检测到区域 %s 未启用\n", regionName)
+	if !yes(input("是否启用？[y/N]: ", "n")) {
 		return fmt.Errorf("取消")
 	}
-
-	// 2. 发起启用请求
-	{
-		cfg, err := mkCfg(ctx, bootstrapRegion, creds) // 使用 us-east-1 发起请求
-		if err != nil {
-			return err
-		}
-		acctCli := account.NewFromConfig(cfg)
-		_, err = acctCli.EnableRegion(ctx, &account.EnableRegionInput{RegionName: aws.String(regionName)})
-		if err != nil {
-			errMsg := err.Error()
-			// 关键修改：如果 AWS 返回 ValidationException (状态无法切换) 或 ResourceAlreadyExists
-			// 说明区域其实已经是“可用”或“正在处理”状态，我们应该忽略这个错误，去尝试创建实例
-			if strings.Contains(errMsg, "ValidationException") || strings.Contains(errMsg, "ResourceAlreadyExists") {
-				fmt.Println("⚠️  AWS 提示: 区域状态无需更改 (可能已在启用中)，尝试继续...")
-			} else {
-				return fmt.Errorf("API 调用失败: %v", err)
-			}
-		} else {
-			fmt.Println("⏳ 启用请求已发送...")
+	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
+	if err != nil {
+		return err
+	}
+	acctCli := account.NewFromConfig(cfg)
+	_, err = acctCli.EnableRegion(ctx, &account.EnableRegionInput{RegionName: aws.String(regionName)})
+	if err != nil {
+		if !strings.Contains(err.Error(), "ResourceAlreadyExists") && !strings.Contains(err.Error(), "Region is enabled") {
+			return fmt.Errorf("失败: %v", err)
 		}
 	}
-
-WAIT_LOOP:
-	// 3. 循环检查状态
-	cfg, _ := mkCfg(ctx, bootstrapRegion, creds)
+	fmt.Println("⏳ 请求已发送...")
 	ec2Cli := ec2.NewFromConfig(cfg)
-	fmt.Print("⏳ 正在等待区域就绪 (可能需要几分钟)...")
-
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-
-	// 最多等待 60 次 (10分钟)，防止死循环
-	for i := 0; i < 60; i++ {
+	for {
 		<-ticker.C
 		out, err := ec2Cli.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
 			RegionNames: []string{regionName},
 			AllRegions:  aws.Bool(true),
 		})
 		if err != nil {
-			fmt.Print("x") // 网络或权限错误，打印 x 继续重试
+			fmt.Print("x")
 			continue
 		}
 		if len(out.Regions) > 0 {
 			status := aws.ToString(out.Regions[0].OptInStatus)
-			// 打印当前状态缩写
-			switch status {
-			case "opted-in":
-				fmt.Printf(" [✅ 已启用]\n")
+			fmt.Printf("[%s] ", status)
+			if status == "opted-in" {
+				fmt.Println("\n✅ 区域已成功启用！")
 				return nil
-			case "enabling":
-				fmt.Printf(" [⏳ 处理中]")
-			case "not-opted-in":
-				fmt.Printf(" [❌ 未启用]")
-			default:
-				fmt.Printf(" [%s]", status)
 			}
 		}
 	}
-
-	// 如果等待超时，询问用户是否强行继续
-	fmt.Println("\n⚠️ 等待超时。")
-	if yes(input("是否忽略状态检查，强行尝试创建实例？(这可能会失败) [y/N]: ", "y")) {
-		return nil
-	}
-	return fmt.Errorf("区域未就绪")
 }
 
 func checkQuotas(ctx context.Context, creds aws.CredentialsProvider) {
@@ -840,9 +929,8 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 	if err != nil {
 		return
 	}
-	// 启用逻辑已修正：会智能忽略 ValidationException 并尝试继续
 	if err := ensureRegionOptIn(ctx, regionInfo.Name, regionInfo.Status, creds); err != nil {
-		fmt.Println("❌ 区域启用失败:", err)
+		fmt.Println("❌ 区域不可用:", err)
 		return
 	}
 	region := regionInfo.Name
@@ -886,95 +974,27 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 	}
 	fmt.Println("✅ 选中 AMI:", ami)
 
-	// --- 详细实例列表 (包含 16vCPU 和 AI 理由) ---
-	var typeList []DetailedTypeOption
+	// Type
+	var typeList []TypeOption
 	if targetArch == "x86_64" {
-		typeList = []DetailedTypeOption{
-			// T2/T3
-			{"t2.micro", 1, 1.0, "1.0 GiB", "$0.0116/h", "T2免费套餐", "内存极低，无法运行模型"},
-			{"t3.micro", 2, 1.0, "1.0 GiB", "$0.0104/h", "T3免费套餐", "内存极低，无法运行模型"},
-			{"t3.medium", 2, 4.0, "4.0 GiB", "$0.0416/h", "T3通用中配", "仅能运行微型量化模型"},
-			{"t3.xlarge", 4, 16.0, "16.0 GiB", "$0.1664/h", "T3通用超大", ""},
-
-			// AI/计算优化 (Intel)
-			{"c6i.large", 2, 4.0, "4.0 GiB", "$0.0850/h", "计算优化 (AVX-512)", "内存较少"},
-			{"c6i.4xlarge", 16, 32.0, "32.0 GiB", "$0.6800/h", "高性能计算 (16 vCPU)", ""}, // 16v
-			{"c7i.large", 2, 4.0, "4.0 GiB", "$0.0895/h", "AI推理 (AMX加速)", "内存较少"},
-			{"c7i.4xlarge", 16, 32.0, "32.0 GiB", "$0.7160/h", "AI高性能 (16 vCPU)", ""}, // 16v
-
-			// 内存优化
-			{"m6i.large", 2, 8.0, "8.0 GiB", "$0.0960/h", "通用/AI推理", ""},
-			{"m7i.large", 2, 8.0, "8.0 GiB", "$0.1008/h", "通用/AI推理 (AMX)", ""},
-		}
+		typeList = []TypeOption{{"t2.nano", "1 vCPU, 0.5 GiB"}, {"t2.micro", "1 vCPU, 1.0 GiB"}, {"t3.micro", "2 vCPU, 1.0 GiB"}}
 	} else {
-		// ARM (Graviton)
-		typeList = []DetailedTypeOption{
-			// T4g
-			{"t4g.nano", 2, 0.5, "0.5 GiB", "$0.0042/h", "Graviton2", "内存极低，无法运行AI"},
-			{"t4g.micro", 2, 1.0, "1.0 GiB", "$0.0084/h", "T4g免费试用", "内存极低，无法运行AI"},
-			{"t4g.medium", 2, 4.0, "4.0 GiB", "$0.0336/h", "T4g通用中配", "仅能运行微型量化模型"},
-
-			// AI/计算优化 (Graviton 3)
-			{"c7g.large", 2, 4.0, "4.0 GiB", "$0.0723/h", "AI推理 (BF16)", "内存较少"},
-			{"c7g.xlarge", 4, 8.0, "8.0 GiB", "$0.1445/h", "AI推理 (BF16)", ""},
-			{"c7g.4xlarge", 16, 32.0, "32.0 GiB", "$0.5780/h", "AI高性能 (16 vCPU)", ""}, // 16v
-
-			// 通用
-			{"m7g.large", 2, 8.0, "8.0 GiB", "$0.0816/h", "通用/AI (BF16)", ""},
-		}
+		typeList = []TypeOption{{"t4g.nano", "2 vCPU, 0.5 GiB"}, {"t4g.micro", "2 vCPU, 1.0 GiB"}}
 	}
-
-	fmt.Printf("\n请选择实例类型 (参考价格基于 us-east-1):\n")
-	printTable("编号\t型号\tvCPU\t内存\t参考价格\t说明", func(w *tabwriter.Writer) {
-		for i, t := range typeList {
-			fmt.Fprintf(w, " %2d)\t%s\t%d\t%s\t%s\t%s\n", i+1, t.Type, t.VCpu, t.RamStr, t.Price, t.Desc)
-		}
-	})
-	fmt.Println(" 99) 手动输入 (如 p3.2xlarge)")
-
+	fmt.Printf("\n请选择实例类型:\n")
+	for i, t := range typeList {
+		fmt.Printf("  %2d) %s\n", i+1, t.Type)
+	}
 	var itype string
-	var selectedOpt DetailedTypeOption
-	tSel := input("请输入编号 [1]: ", "1")
-
-	if tSel == "99" {
-		itype = input("请输入实例类型代码: ", "t3.micro")
-		selectedOpt = DetailedTypeOption{Type: itype, VCpu: 2, RamVal: 4} // 假定默认值
+	tSel := input("编号 [1]: ", "1")
+	idx := mustInt(tSel)
+	if idx > 0 && idx <= len(typeList) {
+		itype = typeList[idx-1].Type
 	} else {
-		idx := mustInt(tSel)
-		if idx > 0 && idx <= len(typeList) {
-			selectedOpt = typeList[idx-1]
-			itype = selectedOpt.Type
-		} else {
-			selectedOpt = typeList[0]
-			itype = selectedOpt.Type
-		}
-	}
-	fmt.Printf("✅ 已选择: %s\n", itype)
-
-	// --- AI 适用性智能检查 ---
-	fmt.Println("\n🔍 正在进行 AI 负载适用性检查...")
-	isAiSuitable := true
-	if selectedOpt.AiReason != "" {
-		fmt.Printf("⚠️  警告: 此实例 [%s] 不推荐用于 AI。\n", itype)
-		fmt.Printf("   理由: %s\n", selectedOpt.AiReason)
-		isAiSuitable = false
-	} else if selectedOpt.RamVal < 8.0 {
-		fmt.Printf("⚠️  警告: 此实例内存 (%.1f GB) 较低。\n", selectedOpt.RamVal)
-		fmt.Println("   理由: 现代 LLM (如 Llama-3-8B) 通常需要至少 8GB-16GB 内存才能运行。")
-		isAiSuitable = false
+		itype = typeList[0].Type
 	}
 
-	if !isAiSuitable {
-		if !yes(input("确认要继续使用此实例吗？(可能导致 OOM 崩溃) [y/N]: ", "n")) {
-			fmt.Println("🚫 已取消操作。")
-			return
-		}
-	} else {
-		fmt.Println("✅ 配置检测通过：适合运行 AI 推理任务。")
-	}
-	// ---
-
-	count := int32(mustInt(input("\n启动数量 [1]: ", "1")))
+	count := int32(mustInt(input("启动数量 [1]: ", "1")))
 	if count < 1 {
 		count = 1
 	}
@@ -1025,6 +1045,7 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 		MinCount:     aws.Int32(count),
 		MaxCount:     aws.Int32(count),
 	}
+	// 恢复 Base64 编码
 	if userData != "" {
 		runIn.UserData = aws.String(base64.StdEncoding.EncodeToString([]byte(userData)))
 	}
@@ -1142,6 +1163,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		if b.IsActive != nil && !*b.IsActive {
 			continue
 		}
+		// 恢复 Lightsail Types 使用
 		if b.SupportedPlatforms != nil && len(b.SupportedPlatforms) > 0 && b.SupportedPlatforms[0] == lst.InstancePlatformWindows {
 			continue
 		}
@@ -1173,6 +1195,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	var osList []string
 	defOSIdx := 1
 	for _, p := range pOut.Blueprints {
+		// 恢复 Lightsail Types 使用
 		if p.Platform == lst.InstancePlatformLinuxUnix {
 			osList = append(osList, *p.BlueprintId)
 		}
@@ -1220,6 +1243,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		}
 		if ready {
 			fmt.Println("\n✅ 实例已就绪，正在开启端口...")
+			// 恢复 Lightsail Types 使用
 			cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
 				InstanceName: aws.String(name),
 				PortInfos: []lst.PortInfo{
@@ -1234,7 +1258,6 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	}
 }
 
-// 修正后的 lsControl 函数：使用 lightsail client 
 func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
 	rows, _ := lsListAll(ctx, regions, creds)
 	if len(rows) == 0 {
@@ -1252,7 +1275,7 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 	}
 	sel := rows[idx-1]
 	cfg, _ := mkCfg(ctx, sel.Region, creds)
-	cli := lightsail.NewFromConfig(cfg) // ✅ 修正为 Lightsail 客户端
+	cli := lightsail.NewFromConfig(cfg)
 	fmt.Printf("\n🔍 正在获取 Lightsail 实例 %s 的详细指标...\n", sel.Name)
 	insOut, err := cli.GetInstance(ctx, &lightsail.GetInstanceInput{InstanceName: &sel.Name})
 	var isStaticIP bool
@@ -1482,9 +1505,8 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	ctx := context.Background()
-	fmt.Println("=== AWS 管理工具 (Win) - 编译修复版 ===")
+	fmt.Println("=== AWS 管理工具 (Kiro 修正版) ===")
 
-	// 代理选择菜单
 	fmt.Println("\n请选择连接方式:")
 	fmt.Println(" 1) 直连 (Direct Connection) [默认]")
 	fmt.Println(" 2) 代理 (Use Proxy)")
@@ -1520,23 +1542,24 @@ func main() {
 
 	for {
 		fmt.Println("\n====== 主菜单 ======")
-		fmt.Println("1) EC2：创建")
-		fmt.Println("2) EC2：管理")
+		fmt.Println("1) EC2：创建 (自动AMI/IPv6/磁盘)")
+		fmt.Println("2) EC2：管理 (全球扫描)")
 		fmt.Println("3) Lightsail：创建")
 		fmt.Println("4) Lightsail：管理")
 		fmt.Println("5) 查询配额")
 		fmt.Println("6) 💰 自动完成新手任务 (赚 $80)")
+		fmt.Println("7) 🧠 Kiro (Kendra Ranking) 管理") // 保持原位
 		fmt.Println("0) 退出")
 
 		switch input("选择: ", "0") {
 		case "1":
 			ec2Create(ctx, ec2Regions, creds)
 		case "2":
-			var plainRegions []string
+			var rgs []string
 			for _, r := range ec2Regions {
-				plainRegions = append(plainRegions, r.Name)
+				rgs = append(rgs, r.Name)
 			}
-			ec2Control(ctx, plainRegions, creds)
+			ec2Control(ctx, rgs, creds)
 		case "3":
 			lsCreate(ctx, lsRegions, creds)
 		case "4":
@@ -1545,6 +1568,8 @@ func main() {
 			checkQuotas(ctx, creds)
 		case "6":
 			autoClaimCredits(ctx, creds)
+		case "7":
+			kiroManage(ctx, ec2Regions, creds)
 		case "0":
 			return
 		}
